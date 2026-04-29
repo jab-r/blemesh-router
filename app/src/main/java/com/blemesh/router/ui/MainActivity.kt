@@ -99,6 +99,12 @@ class MainActivity : ComponentActivity() {
             text = "Disable battery optimization"
             setOnClickListener { requestBatteryExemption() }
         }
+        val settingsButton = Button(this).apply {
+            text = "Settings"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, ConfigActivity::class.java))
+            }
+        }
         val stopButton = Button(this).apply {
             text = "Stop service"
             setOnClickListener {
@@ -123,6 +129,7 @@ class MainActivity : ComponentActivity() {
         column.addView(sectionHeader("Stats"))
         column.addView(statsView)
         column.addView(batteryButton)
+        column.addView(settingsButton)
         column.addView(stopButton)
 
         return ScrollView(this).apply {
@@ -160,7 +167,9 @@ class MainActivity : ComponentActivity() {
             statsView.text = ""
             return
         }
-        idView.text = snap.peerID.rawValue
+        val ssidLine = if (snap.configuredSsid.isBlank()) "(no Wi-Fi configured)"
+        else "Wi-Fi: " + snap.configuredSsid
+        idView.text = snap.peerID.rawValue + "\n" + ssidLine
         blePeersView.text = if (snap.blePeers.isEmpty()) {
             "(none)"
         } else {

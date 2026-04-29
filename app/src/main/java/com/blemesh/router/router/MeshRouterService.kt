@@ -12,6 +12,7 @@ import com.blemesh.router.mesh.BleMeshService
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
+import com.blemesh.router.transport.LanPeerDiscovery
 import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
 import com.blemesh.router.util.MessageDeduplicator
@@ -79,6 +80,7 @@ class MeshRouterService : Service() {
 
     private lateinit var bleMeshService: BleMeshService
     private lateinit var transports: List<RouterTransport>
+    private lateinit var lanDiscovery: LanPeerDiscovery
 
     // Dedup for packets crossing the BLE↔bridge boundary
     private val bridgeDeduplicator = MessageDeduplicator(
@@ -102,6 +104,8 @@ class MeshRouterService : Service() {
         transports = TransportSelector.build(this, myPeerID, serviceScope)
         for (t in transports) t.listener = transportListener
 
+        lanDiscovery = LanPeerDiscovery(this)
+
         INSTANCE = this
     }
 
@@ -114,8 +118,24 @@ class MeshRouterService : Service() {
             else Log.i(TAG, "Skipping unavailable transport: ${t.name}")
         }
 
+        // Apply saved Wi-Fi credentials so the device auto-associates to the
+        // backbone SSID. No-op if not configured or on API < 29.
+        val credentials = WifiCredentials.load(this)
+        if (credentials.isConfigured) {
+            WifiNetworkApplicator(this).apply(credentials)
+        }
+
+        // Auto-discover other routers on the same LAN via mDNS, then hand
+        // host:port pairs to the TCP transport for connect-and-handshake.
+        val tcp = transports.filterIsInstance<WifiBridgeTransport>().firstOrNull()
+        if (tcp != null) {
+            lanDiscovery.start(myPeerID, WifiBridgeTransport.DEFAULT_PORT) { host, port, _ ->
+                tcp.connectToHost(host, port)
+            }
+        }
+
+        // Manual host overrides (still supported for dev / fallback).
         intent?.getStringExtra(EXTRA_CONNECT_TO)?.let { connectList ->
-            val tcp = transports.filterIsInstance<WifiBridgeTransport>().firstOrNull()
             if (tcp != null) {
                 for (entry in connectList.split(",")) {
                     val parts = entry.trim().split(":")
@@ -136,6 +156,7 @@ class MeshRouterService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        lanDiscovery.stop()
         bleMeshService.stop()
         for (t in transports) t.stop()
         serviceScope.cancel()
@@ -149,6 +170,7 @@ class MeshRouterService : Service() {
 
     data class Snapshot(
         val peerID: PeerID,
+        val configuredSsid: String,
         val blePeers: List<PeerID>,
         val transports: List<TransportSnapshot>,
         val bleToBridge: Long,
@@ -163,6 +185,7 @@ class MeshRouterService : Service() {
 
     fun snapshot(): Snapshot = Snapshot(
         peerID = myPeerID,
+        configuredSsid = WifiCredentials.load(this).ssid,
         blePeers = bleMeshService.getConnectedPeerIDs(),
         transports = transports.map {
             TransportSnapshot(
