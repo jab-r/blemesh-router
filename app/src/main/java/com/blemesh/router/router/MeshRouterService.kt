@@ -12,25 +12,26 @@ import com.blemesh.router.mesh.BleMeshService
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
-import com.blemesh.router.protocol.BlemeshProtocol
+import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
 import com.blemesh.router.util.MessageDeduplicator
 import kotlinx.coroutines.*
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Main BLE Mesh Router service.
  *
- * Orchestrates the BLE mesh and WiFi bridge transport layers to route packets:
+ * Orchestrates the BLE mesh and one-or-more router-to-router transports
+ * (TCP-over-LAN, Wi-Fi Aware, Wi-Fi Direct):
  *
- * 1. Packets received from BLE mesh destined for non-local peers → forwarded over WiFi
- * 2. Packets received from WiFi bridge → injected into local BLE mesh
- * 3. Broadcast packets → forwarded in both directions
- * 4. Gossip sync → operates on both BLE and WiFi layers
+ * 1. Packets received from BLE mesh destined for non-local peers → forwarded
+ *    over the router-to-router transport(s).
+ * 2. Packets received over a router transport → injected into local BLE mesh.
+ * 3. Broadcast packets → forwarded in both directions.
+ * 4. Gossip sync → operates on both BLE and bridge layers.
  *
  * Architecture:
  * ```
- * [Remote BLE Mesh] <--BLE--> [This Router] <--WiFi--> [Other Router] <--BLE--> [Remote BLE Mesh]
+ * [BLE peers] <--BLE--> [This Router] <--Wi-Fi--> [Other Router] <--BLE--> [BLE peers]
  * ```
  */
 class MeshRouterService : Service() {
@@ -43,10 +44,14 @@ class MeshRouterService : Service() {
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
 
+        @Volatile
+        var INSTANCE: MeshRouterService? = null
+            private set
+
         /**
-         * Packet types that should be routed over WiFi (not just local relay).
-         * UWB_RANGING is intentionally excluded — ranging is meaningful only
-         * within BLE radio range.
+         * Packet types that should be routed over a Wi-Fi bridge (not just
+         * local BLE relay). UWB_RANGING is excluded — ranging is meaningful
+         * only within BLE radio range.
          */
         private val ROUTABLE_TYPES: Set<Int> = setOf(
             MessageType.ANNOUNCE.value.toInt() and 0xFF,
@@ -70,78 +75,110 @@ class MeshRouterService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val myPeerID = PeerID.generate()
+    private lateinit var myPeerID: PeerID
 
     private lateinit var bleMeshService: BleMeshService
-    private lateinit var wifiBridge: WifiBridgeTransport
+    private val transports = mutableListOf<RouterTransport>()
+    private lateinit var tcpBridge: WifiBridgeTransport
 
-    // Dedup for packets crossing the BLE↔WiFi boundary
+    // Dedup for packets crossing the BLE↔bridge boundary
     private val bridgeDeduplicator = MessageDeduplicator(
         maxAgeMillis = 60_000L,
         maxEntries = 2000
     )
 
-    // Track which PeerIDs are known to be on which WiFi router
-    private val remotePeerToRouter = ConcurrentHashMap<PeerID, String>()
-
-    // Stats
-    private var bleToWifiCount = 0L
-    private var wifiToBleCount = 0L
+    @Volatile var bleToBridgeCount = 0L
+        private set
+    @Volatile var bridgeToBleCount = 0L
+        private set
 
     override fun onCreate() {
         super.onCreate()
+        myPeerID = LocalIdentity.load(this)
         Log.i(TAG, "MeshRouterService created, PeerID: ${myPeerID.rawValue}")
 
         bleMeshService = BleMeshService(this, myPeerID, serviceScope)
-        wifiBridge = WifiBridgeTransport(serviceScope)
-
         bleMeshService.packetListener = blePacketListener
-        wifiBridge.packetListener = wifiPacketListener
+
+        tcpBridge = WifiBridgeTransport(serviceScope, myPeerID)
+        tcpBridge.listener = transportListener
+        transports.add(tcpBridge)
+
+        INSTANCE = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, createNotification())
 
-        val wifiPort = intent?.getIntExtra(EXTRA_WIFI_PORT, WifiBridgeTransport.DEFAULT_PORT)
-            ?: WifiBridgeTransport.DEFAULT_PORT
-
-        // Start BLE mesh and WiFi bridge
         bleMeshService.start()
-        wifiBridge.start()
+        for (t in transports) {
+            if (t.isAvailable()) t.start()
+            else Log.i(TAG, "Skipping unavailable transport: ${t.name}")
+        }
 
-        // Connect to specified routers
         intent?.getStringExtra(EXTRA_CONNECT_TO)?.let { connectList ->
             for (entry in connectList.split(",")) {
                 val parts = entry.trim().split(":")
-                if (parts.size == 2) {
-                    val host = parts[0]
-                    val port = parts[1].toIntOrNull() ?: WifiBridgeTransport.DEFAULT_PORT
-                    wifiBridge.connectToRouter(host, port)
-                } else if (parts.size == 1 && parts[0].isNotBlank()) {
-                    wifiBridge.connectToRouter(parts[0])
+                when (parts.size) {
+                    2 -> {
+                        val port = parts[1].toIntOrNull() ?: WifiBridgeTransport.DEFAULT_PORT
+                        tcpBridge.connectToHost(parts[0], port)
+                    }
+                    1 -> if (parts[0].isNotBlank()) tcpBridge.connectToHost(parts[0])
                 }
             }
         }
 
-        Log.i(TAG, "Router started: BLE mesh active, WiFi bridge on port $wifiPort")
+        Log.i(TAG, "Router started with ${transports.size} transport(s)")
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
         bleMeshService.stop()
-        wifiBridge.stop()
+        for (t in transports) t.stop()
         serviceScope.cancel()
-        Log.i(TAG, "Router stopped. Stats: BLE→WiFi=$bleToWifiCount, WiFi→BLE=$wifiToBleCount")
+        INSTANCE = null
+        Log.i(TAG, "Router stopped. Stats: BLE→bridge=$bleToBridgeCount, bridge→BLE=$bridgeToBleCount")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // --- BLE Mesh → WiFi Bridge ---
+    // --- Snapshot for UI ---
+
+    data class Snapshot(
+        val peerID: PeerID,
+        val blePeers: List<PeerID>,
+        val transports: List<TransportSnapshot>,
+        val bleToBridge: Long,
+        val bridgeToBle: Long
+    )
+
+    data class TransportSnapshot(
+        val name: String,
+        val available: Boolean,
+        val peers: List<PeerID>
+    )
+
+    fun snapshot(): Snapshot = Snapshot(
+        peerID = myPeerID,
+        blePeers = bleMeshService.getConnectedPeerIDs(),
+        transports = transports.map {
+            TransportSnapshot(
+                name = it.name,
+                available = it.isAvailable(),
+                peers = it.connectedPeerIDs()
+            )
+        },
+        bleToBridge = bleToBridgeCount,
+        bridgeToBle = bridgeToBleCount
+    )
+
+    // --- BLE Mesh → bridge ---
 
     private val blePacketListener = object : BleMeshService.PacketListener {
         override fun onPacketReceived(packet: BlemeshPacket, fromAddress: String) {
-            routeBlePacketToWifi(packet)
+            routeBlePacketToBridge(packet)
         }
 
         override fun onPeerDiscovered(peerID: PeerID, address: String) {
@@ -153,108 +190,75 @@ class MeshRouterService : Service() {
         }
     }
 
-    /**
-     * Route a BLE mesh packet to the WiFi bridge.
-     *
-     * Decision logic:
-     * - Broadcast packets: always forward to all WiFi routers
-     * - Directed packets for local peers: don't forward (already delivered locally)
-     * - Directed packets for non-local peers: forward to WiFi routers
-     * - REQUEST_SYNC with TTL=0: don't forward (local-only by design)
-     */
-    private fun routeBlePacketToWifi(packet: BlemeshPacket) {
+    private fun routeBlePacketToBridge(packet: BlemeshPacket) {
         val typeInt = packet.type.toInt() and 0xFF
         if (typeInt !in ROUTABLE_TYPES) return
 
         // Don't bridge local-only REQUEST_SYNC (TTL=0)
         if (packet.type == MessageType.REQUEST_SYNC.value && (packet.ttl.toInt() and 0xFF) == 0) return
 
-        // Skip if already bridged
-        val dedupKey = "ble2wifi-${packet.senderId}-${packet.timestamp}-${packet.type}"
+        val dedupKey = "ble2br-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
         if (packet.isBroadcast) {
-            // Broadcast: forward to all WiFi routers
-            wifiBridge.broadcastToRouters(packet)
-            bleToWifiCount++
-        } else {
-            // Directed: check if recipient is local
-            val recipientPeerID = packet.recipientPeerID()
-            if (recipientPeerID != null && bleMeshService.isLocalPeer(recipientPeerID)) {
-                // Recipient is local, no need to bridge
-                return
-            }
+            for (t in transports) t.broadcast(packet)
+            bleToBridgeCount++
+            return
+        }
 
-            // Recipient is not local — route over WiFi
-            val targetRouter = recipientPeerID?.let { remotePeerToRouter[it] }
-            if (targetRouter != null) {
-                // We know which router has this peer
-                wifiBridge.sendToRouter(targetRouter, packet)
-            } else {
-                // Don't know where the peer is — broadcast to all routers
-                wifiBridge.broadcastToRouters(packet)
-            }
-            bleToWifiCount++
+        val recipient = packet.recipientPeerID()
+        if (recipient != null && bleMeshService.isLocalPeer(recipient)) {
+            return  // already deliverable locally
+        }
+
+        // Directed: send via the transport that has the recipient if any,
+        // otherwise broadcast to all transports.
+        val targeted = recipient?.let { r ->
+            transports.firstOrNull { r in it.connectedPeerIDs() }?.also { it.sendToPeer(r, packet) }
+        }
+        if (targeted == null) {
+            for (t in transports) t.broadcast(packet)
+        }
+        bleToBridgeCount++
+    }
+
+    // --- Bridge → BLE Mesh ---
+
+    private val transportListener = object : RouterTransport.Listener {
+        override fun onTransportPeerConnected(transport: RouterTransport, peer: PeerID) {
+            Log.i(TAG, "Router peer connected via ${transport.name}: ${peer.rawValue.take(8)}")
+        }
+
+        override fun onTransportPeerDisconnected(transport: RouterTransport, peer: PeerID) {
+            Log.i(TAG, "Router peer disconnected from ${transport.name}: ${peer.rawValue.take(8)}")
+        }
+
+        override fun onTransportPacketReceived(
+            transport: RouterTransport,
+            packet: BlemeshPacket,
+            fromPeer: PeerID
+        ) {
+            routeBridgePacketToBle(transport, packet, fromPeer)
         }
     }
 
-    // --- WiFi Bridge → BLE Mesh ---
-
-    private val wifiPacketListener = object : WifiBridgeTransport.PacketListener {
-        override fun onWifiPacketReceived(packet: BlemeshPacket, fromRouter: String) {
-            routeWifiPacketToBle(packet, fromRouter)
-        }
-
-        override fun onRouterConnected(address: String) {
-            Log.i(TAG, "WiFi router connected: $address")
-        }
-
-        override fun onRouterDisconnected(address: String) {
-            Log.i(TAG, "WiFi router disconnected: $address")
-            // Clean up peer mappings for this router
-            val peersToRemove = remotePeerToRouter.entries
-                .filter { it.value == address }
-                .map { it.key }
-            peersToRemove.forEach { remotePeerToRouter.remove(it) }
-        }
-    }
-
-    /**
-     * Route a WiFi-received packet into the local BLE mesh.
-     *
-     * Decision logic:
-     * - Learn sender's router affiliation (for directed routing later)
-     * - Skip if already seen (dedup)
-     * - Inject into local BLE mesh for delivery to local peers
-     * - Also forward to other WiFi routers (multi-hop bridging)
-     */
-    private fun routeWifiPacketToBle(packet: BlemeshPacket, fromRouter: String) {
-        // Skip if already bridged
-        val dedupKey = "wifi2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
+    private fun routeBridgePacketToBle(
+        fromTransport: RouterTransport,
+        packet: BlemeshPacket,
+        fromRouter: PeerID
+    ) {
+        val dedupKey = "br2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
-        // Learn: remember that this sender's PeerID is reachable via fromRouter
-        val senderPeerID = packet.senderPeerID()
-        if (senderPeerID != null) {
-            remotePeerToRouter[senderPeerID] = fromRouter
-        }
-
-        // Handle ANNOUNCE: track remote peer's router
-        if (packet.type == MessageType.ANNOUNCE.value) {
-            val announcement = com.blemesh.router.model.AnnouncementData.decode(packet.payload)
-            if (announcement != null && senderPeerID != null) {
-                Log.d(TAG, "Remote peer ${senderPeerID.rawValue.take(8)} (${announcement.nickname}) via router $fromRouter")
-            }
-        }
-
-        // Inject into local BLE mesh
         bleMeshService.injectPacketFromWifi(packet)
-        wifiToBleCount++
+        bridgeToBleCount++
 
-        // Multi-hop: forward to other WiFi routers (excluding the source)
-        for (routerAddress in wifiBridge.getConnectedRouters()) {
-            if (routerAddress != fromRouter) {
-                wifiBridge.sendToRouter(routerAddress, packet)
+        // Multi-hop: forward to other router peers (across all transports)
+        // excluding the one we just heard it from.
+        for (t in transports) {
+            for (peerID in t.connectedPeerIDs()) {
+                if (t === fromTransport && peerID == fromRouter) continue
+                t.sendToPeer(peerID, packet)
             }
         }
     }
@@ -267,16 +271,12 @@ class MeshRouterService : Service() {
                 NOTIFICATION_CHANNEL_ID,
                 "BLE Mesh Router",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "BLE mesh routing service"
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            ).apply { description = "BLE mesh routing service" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
-
         return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setContentTitle("BLE Mesh Router")
-            .setContentText("Routing BLE mesh traffic over WiFi")
+            .setContentText("Routing BLE mesh traffic over Wi-Fi")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .build()

@@ -13,141 +13,125 @@ import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * WiFi bridge transport for forwarding BLE mesh packets between router access points.
+ * TCP-over-LAN router-to-router transport.
  *
- * Protocol: Simple length-prefixed framing over TCP.
- *   [length:4 bytes big-endian][blemesh packet data: length bytes]
+ * Frame: [length:4 BE][BlemeshPacket bytes].
  *
- * Each router runs a TCP server and connects to other routers as clients.
- * Packets received from the BLE mesh that are destined for non-local peers
- * are forwarded over WiFi to connected router peers.
+ * Connection handshake (immediately after TCP connect, both directions):
+ *   [version:1][peerID:8]
+ *
+ * The handshake lets us key connections by [PeerID] so the bridge can route
+ * directed packets to a specific remote router without tracking host:port.
+ *
+ * Each router runs a TCP server on [port] and may also dial out to peer
+ * routers via [connectToHost].
  */
 class WifiBridgeTransport(
     private val scope: CoroutineScope,
+    private val localPeerID: PeerID,
     private val port: Int = DEFAULT_PORT
-) {
+) : RouterTransport {
+
     companion object {
         private const val TAG = "WifiBridgeTransport"
         const val DEFAULT_PORT = 9742
         private const val MAX_PACKET_SIZE = 65536
+        private const val HANDSHAKE_VERSION: Byte = 0x01
+        private const val HANDSHAKE_TIMEOUT_MS = 5000
         private const val RECONNECT_DELAY_MS = 5000L
-        private const val HEARTBEAT_INTERVAL_MS = 15000L
-        private const val HEARTBEAT_TIMEOUT_MS = 45000L
     }
 
-    /**
-     * Callback for packets received from WiFi peers.
-     */
-    interface PacketListener {
-        fun onWifiPacketReceived(packet: BlemeshPacket, fromRouter: String)
-        fun onRouterConnected(address: String)
-        fun onRouterDisconnected(address: String)
-    }
+    override val name: String = "tcp"
+    override var listener: RouterTransport.Listener? = null
 
-    var packetListener: PacketListener? = null
-
-    // Connected WiFi router peers: address -> connection
-    private val connections = ConcurrentHashMap<String, RouterConnection>()
+    private val connections = ConcurrentHashMap<PeerID, RouterConnection>()
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private var isRunning = false
 
-    data class RouterConnection(
-        val address: String,
+    private data class RouterConnection(
+        val peerID: PeerID,
         val socket: Socket,
         val output: DataOutputStream,
         val input: DataInputStream,
-        var lastActivity: Long = System.currentTimeMillis(),
         var readJob: Job? = null
     )
 
-    // --- Lifecycle ---
+    // --- RouterTransport ---
 
-    fun start() {
+    override fun isAvailable(): Boolean = true
+
+    override fun start() {
         if (isRunning) return
         isRunning = true
         startServer()
-        startHeartbeatMonitor()
-        Log.i(TAG, "WiFi bridge transport started on port $port")
+        Log.i(TAG, "TCP bridge transport started on port $port (peer ${localPeerID.rawValue.take(8)})")
     }
 
-    fun stop() {
+    override fun stop() {
         if (!isRunning) return
         isRunning = false
         serverJob?.cancel()
-        for ((address, conn) in connections) {
-            disconnectRouter(address)
+        for (peerID in connections.keys.toList()) {
+            disconnectPeer(peerID)
         }
         try { serverSocket?.close() } catch (_: Exception) { }
         serverSocket = null
-        Log.i(TAG, "WiFi bridge transport stopped")
+        Log.i(TAG, "TCP bridge transport stopped")
     }
 
-    // --- Public API ---
+    override fun broadcast(packet: BlemeshPacket) {
+        val encoded = BinaryProtocol.encode(packet) ?: return
+        for (conn in connections.values) {
+            sendRaw(conn, encoded)
+        }
+    }
 
-    /** Connect to a remote router by IP address. */
-    fun connectToRouter(host: String, remotePort: Int = port) {
-        val address = "$host:$remotePort"
-        if (connections.containsKey(address)) return
+    override fun sendToPeer(peerID: PeerID, packet: BlemeshPacket) {
+        val conn = connections[peerID] ?: return
+        val encoded = BinaryProtocol.encode(packet) ?: return
+        sendRaw(conn, encoded)
+    }
 
+    override fun connectedPeerIDs(): List<PeerID> = connections.keys.toList()
+
+    // --- Public manual-config API ---
+
+    /**
+     * Dial a remote router by host:port. The peer's PeerID is learned via
+     * the post-connect handshake; the connection is then registered.
+     */
+    fun connectToHost(host: String, remotePort: Int = port) {
         scope.launch(Dispatchers.IO) {
+            val target = "$host:$remotePort"
             try {
-                Log.d(TAG, "Connecting to router at $address")
-                val socket = Socket()
-                socket.connect(InetSocketAddress(host, remotePort), 5000)
-                socket.tcpNoDelay = true
-                // OS-level keep-alive detects silently-dead TCP sessions (NAT timeouts,
-                // WiFi drops) without us needing to ship heartbeat frames.
-                socket.keepAlive = true
+                Log.d(TAG, "Connecting to router at $target")
+                val socket = Socket().apply {
+                    connect(InetSocketAddress(host, remotePort), 5000)
+                    tcpNoDelay = true
+                    keepAlive = true
+                    soTimeout = HANDSHAKE_TIMEOUT_MS
+                }
+                val output = DataOutputStream(socket.getOutputStream())
+                val input = DataInputStream(socket.getInputStream())
 
-                val conn = RouterConnection(
-                    address = address,
-                    socket = socket,
-                    output = DataOutputStream(socket.getOutputStream()),
-                    input = DataInputStream(socket.getInputStream())
-                )
-                connections[address] = conn
-                conn.readJob = startReading(conn)
-
-                Log.i(TAG, "Connected to router at $address")
-                packetListener?.onRouterConnected(address)
+                writeHandshake(output)
+                val remotePeer = readHandshake(input)
+                if (remotePeer == null) {
+                    Log.w(TAG, "Handshake failed with $target")
+                    try { socket.close() } catch (_: Exception) { }
+                    return@launch
+                }
+                socket.soTimeout = 0
+                registerConnection(remotePeer, socket, output, input)
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to connect to router at $address: ${e.message}")
-                // Schedule reconnect
+                Log.w(TAG, "Failed to connect to $target: ${e.message}")
                 if (isRunning) {
                     delay(RECONNECT_DELAY_MS)
-                    connectToRouter(host, remotePort)
+                    connectToHost(host, remotePort)
                 }
             }
         }
-    }
-
-    /** Disconnect from a remote router. */
-    fun disconnectRouter(address: String) {
-        val conn = connections.remove(address) ?: return
-        conn.readJob?.cancel()
-        try { conn.socket.close() } catch (_: Exception) { }
-        packetListener?.onRouterDisconnected(address)
-    }
-
-    /** Get list of connected router addresses. */
-    fun getConnectedRouters(): List<String> {
-        return connections.keys.toList()
-    }
-
-    /** Send a BLE mesh packet to all connected WiFi routers. */
-    fun broadcastToRouters(packet: BlemeshPacket) {
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        for ((address, conn) in connections) {
-            sendRawToRouter(conn, encoded)
-        }
-    }
-
-    /** Send a BLE mesh packet to a specific router. */
-    fun sendToRouter(address: String, packet: BlemeshPacket) {
-        val conn = connections[address] ?: return
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        sendRawToRouter(conn, encoded)
     }
 
     // --- Server ---
@@ -159,40 +143,101 @@ class WifiBridgeTransport(
                 Log.d(TAG, "TCP server listening on port $port")
                 while (isActive && isRunning) {
                     val socket = serverSocket?.accept() ?: break
-                    handleIncomingConnection(socket)
+                    handleIncoming(socket)
                 }
             } catch (e: Exception) {
-                if (isRunning) {
-                    Log.e(TAG, "Server error: ${e.message}")
-                }
+                if (isRunning) Log.e(TAG, "Server error: ${e.message}")
             }
         }
     }
 
-    private fun handleIncomingConnection(socket: Socket) {
-        val remoteAddress = "${socket.inetAddress.hostAddress}:${socket.port}"
-        Log.d(TAG, "Incoming connection from $remoteAddress")
+    private fun handleIncoming(socket: Socket) {
+        scope.launch(Dispatchers.IO) {
+            val remoteAddr = "${socket.inetAddress.hostAddress}:${socket.port}"
+            try {
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                socket.soTimeout = HANDSHAKE_TIMEOUT_MS
+                val output = DataOutputStream(socket.getOutputStream())
+                val input = DataInputStream(socket.getInputStream())
 
-        try {
-            socket.tcpNoDelay = true
-            socket.keepAlive = true
-            val conn = RouterConnection(
-                address = remoteAddress,
-                socket = socket,
-                output = DataOutputStream(socket.getOutputStream()),
-                input = DataInputStream(socket.getInputStream())
-            )
-            connections[remoteAddress] = conn
-            conn.readJob = startReading(conn)
-
-            packetListener?.onRouterConnected(remoteAddress)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to handle incoming connection: ${e.message}")
-            try { socket.close() } catch (_: Exception) { }
+                writeHandshake(output)
+                val remotePeer = readHandshake(input)
+                if (remotePeer == null) {
+                    Log.w(TAG, "Inbound handshake failed from $remoteAddr")
+                    try { socket.close() } catch (_: Exception) { }
+                    return@launch
+                }
+                socket.soTimeout = 0
+                registerConnection(remotePeer, socket, output, input)
+            } catch (e: Exception) {
+                Log.w(TAG, "Inbound connection from $remoteAddr failed: ${e.message}")
+                try { socket.close() } catch (_: Exception) { }
+            }
         }
     }
 
-    // --- Reading ---
+    // --- Handshake ---
+
+    private fun writeHandshake(output: DataOutputStream) {
+        val peerBytes = localPeerID.toBytes() ?: return
+        synchronized(output) {
+            output.writeByte(HANDSHAKE_VERSION.toInt())
+            output.write(peerBytes)
+            output.flush()
+        }
+    }
+
+    private fun readHandshake(input: DataInputStream): PeerID? {
+        val version = input.readByte()
+        if (version != HANDSHAKE_VERSION) {
+            Log.w(TAG, "Unsupported handshake version: $version")
+            return null
+        }
+        val peerBytes = ByteArray(8)
+        input.readFully(peerBytes)
+        return PeerID.fromBytes(peerBytes)
+    }
+
+    private fun registerConnection(
+        remotePeer: PeerID,
+        socket: Socket,
+        output: DataOutputStream,
+        input: DataInputStream
+    ) {
+        if (remotePeer == localPeerID) {
+            Log.w(TAG, "Refusing self-connection ${remotePeer.rawValue.take(8)}")
+            try { socket.close() } catch (_: Exception) { }
+            return
+        }
+        // If we already have a connection to this peer, drop the duplicate.
+        // Deterministic tie-break: keep the one initiated by the smaller PeerID.
+        val existing = connections[remotePeer]
+        if (existing != null) {
+            val keepNew = localPeerID.rawValue < remotePeer.rawValue
+            if (!keepNew) {
+                Log.d(TAG, "Duplicate connection to ${remotePeer.rawValue.take(8)}; keeping existing")
+                try { socket.close() } catch (_: Exception) { }
+                return
+            }
+            disconnectPeer(remotePeer)
+        }
+
+        val conn = RouterConnection(remotePeer, socket, output, input)
+        connections[remotePeer] = conn
+        conn.readJob = startReading(conn)
+        listener?.onTransportPeerConnected(this, remotePeer)
+        Log.i(TAG, "Connected to router peer ${remotePeer.rawValue.take(8)}")
+    }
+
+    private fun disconnectPeer(peerID: PeerID) {
+        val conn = connections.remove(peerID) ?: return
+        conn.readJob?.cancel()
+        try { conn.socket.close() } catch (_: Exception) { }
+        listener?.onTransportPeerDisconnected(this, peerID)
+    }
+
+    // --- Read loop ---
 
     private fun startReading(conn: RouterConnection): Job {
         return scope.launch(Dispatchers.IO) {
@@ -200,33 +245,27 @@ class WifiBridgeTransport(
                 while (isActive && isRunning && !conn.socket.isClosed) {
                     val length = conn.input.readInt()
                     if (length <= 0 || length > MAX_PACKET_SIZE) {
-                        Log.w(TAG, "Invalid packet length $length from ${conn.address}")
+                        Log.w(TAG, "Invalid frame length $length from ${conn.peerID.rawValue.take(8)}")
                         break
                     }
-
                     val data = ByteArray(length)
                     conn.input.readFully(data)
-                    conn.lastActivity = System.currentTimeMillis()
-
-                    // Decode and deliver
                     val packet = BinaryProtocol.decode(data)
                     if (packet != null) {
-                        packetListener?.onWifiPacketReceived(packet, conn.address)
+                        listener?.onTransportPacketReceived(this@WifiBridgeTransport, packet, conn.peerID)
                     }
                 }
             } catch (e: Exception) {
-                if (isRunning) {
-                    Log.d(TAG, "Connection to ${conn.address} lost: ${e.message}")
-                }
+                if (isRunning) Log.d(TAG, "Read loop ended for ${conn.peerID.rawValue.take(8)}: ${e.message}")
             } finally {
-                disconnectRouter(conn.address)
+                disconnectPeer(conn.peerID)
             }
         }
     }
 
-    // --- Writing ---
+    // --- Write ---
 
-    private fun sendRawToRouter(conn: RouterConnection, data: ByteArray) {
+    private fun sendRaw(conn: RouterConnection, data: ByteArray) {
         scope.launch(Dispatchers.IO) {
             try {
                 synchronized(conn.output) {
@@ -234,27 +273,9 @@ class WifiBridgeTransport(
                     conn.output.write(data)
                     conn.output.flush()
                 }
-                conn.lastActivity = System.currentTimeMillis()
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to send to ${conn.address}: ${e.message}")
-                disconnectRouter(conn.address)
-            }
-        }
-    }
-
-    // --- Heartbeat ---
-
-    private fun startHeartbeatMonitor() {
-        scope.launch {
-            while (isActive && isRunning) {
-                delay(HEARTBEAT_INTERVAL_MS)
-                val now = System.currentTimeMillis()
-                for ((address, conn) in connections) {
-                    if (now - conn.lastActivity > HEARTBEAT_TIMEOUT_MS) {
-                        Log.w(TAG, "Router $address timed out, disconnecting")
-                        disconnectRouter(address)
-                    }
-                }
+                Log.w(TAG, "Send to ${conn.peerID.rawValue.take(8)} failed: ${e.message}")
+                disconnectPeer(conn.peerID)
             }
         }
     }
