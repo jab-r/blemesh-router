@@ -42,9 +42,17 @@ class BleMeshService(
 
         val SERVICE_UUID: UUID = UUID.fromString("F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5D")
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5E")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         private const val DEFAULT_MTU = 512
         private const val SCAN_RESTART_INTERVAL_MS = 30_000L
+
+        // Approximate BlemeshPacket header overhead (version+type+ttl+flags+ts+payloadLen+sender+recipient)
+        private const val BLEMESH_PACKET_OVERHEAD = 30
+        // FRAGMENT packet payload header: [id:8][index:2][total:2][type:1]
+        private const val FRAGMENT_HEADER_BYTES = 13
+        // Inter-fragment pacing to avoid overflowing peer RX buffers on WRITE_NO_RESPONSE.
+        private const val FRAGMENT_PACE_DELAY_MS = 6L
     }
 
     /**
@@ -144,9 +152,8 @@ class BleMeshService(
 
     /** Send a packet to all connected BLE peers (broadcast). */
     fun broadcastPacket(packet: BlemeshPacket) {
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        for ((address, connection) in connectedPeers) {
-            writeToConnection(connection, encoded)
+        for ((_, connection) in connectedPeers) {
+            sendPacketToConnection(connection, packet)
         }
     }
 
@@ -159,11 +166,10 @@ class BleMeshService(
             return
         }
         val connection = connectedPeers[address] ?: return
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        writeToConnection(connection, encoded)
+        sendPacketToConnection(connection, packet)
     }
 
-    /** Send raw encoded data to all connected peers. */
+    /** Send raw pre-encoded data to all connected peers. Caller is responsible for MTU sizing. */
     fun broadcastRaw(data: ByteArray) {
         for ((_, connection) in connectedPeers) {
             writeToConnection(connection, data)
@@ -379,15 +385,28 @@ class BleMeshService(
             val service = gatt.getService(SERVICE_UUID) ?: return
             val char = service.getCharacteristic(CHARACTERISTIC_UUID) ?: return
 
+            // Fire-and-forget writes mirror the mesh's notification-shaped traffic.
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+
             val address = gatt.device.address
             connectedPeers[address]?.let {
                 connectedPeers[address] = it.copy(characteristic = char)
             }
 
-            // Enable notifications
+            // Enable notifications locally AND on the peer via CCCD, otherwise
+            // the peer's GATT server will never send us onCharacteristicChanged.
             try {
                 gatt.setCharacteristicNotification(char, true)
-            } catch (_: SecurityException) { }
+                val cccd = char.getDescriptor(CCCD_UUID)
+                if (cccd != null) {
+                    cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(cccd)
+                } else {
+                    Log.w(TAG, "No CCCD descriptor on characteristic for $address")
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "CCCD enable failed: ${e.message}")
+            }
 
             Log.d(TAG, "Services discovered for $address, ready for data")
         }
@@ -459,18 +478,19 @@ class BleMeshService(
     }
 
     private fun handleFragment(packet: BlemeshPacket, fromAddress: String) {
-        if (packet.payload.size < 10) return
+        // Wire format: [id:8][index:2 BE][total:2 BE][originalType:1][data:var] = 13-byte header
+        if (packet.payload.size < 13) return
         val fragmentId = packet.payload.copyOfRange(0, 8)
-        val index = packet.payload[8].toInt() and 0xFF
-        val total = packet.payload[9].toInt() and 0xFF
-        val fragmentData = packet.payload.copyOfRange(10, packet.payload.size)
+        val index = ((packet.payload[8].toInt() and 0xFF) shl 8) or (packet.payload[9].toInt() and 0xFF)
+        val total = ((packet.payload[10].toInt() and 0xFF) shl 8) or (packet.payload[11].toInt() and 0xFF)
+        val originalType = packet.payload[12]
+        val fragmentData = packet.payload.copyOfRange(13, packet.payload.size)
 
         // Track fragment in gossip for sync
         gossipSyncManager.onPublicPacketSeen(packet)
 
-        val reassembled = reassemblyBuffer.addFragment(fragmentId, index, total, packet.type, fragmentData)
+        val reassembled = reassemblyBuffer.addFragment(fragmentId, index, total, originalType, fragmentData)
         if (reassembled != null) {
-            // Decode reassembled packet
             val innerPacket = BinaryProtocol.decode(reassembled)
             if (innerPacket != null) {
                 packetListener?.onPacketReceived(innerPacket, fromAddress)
@@ -506,7 +526,7 @@ class BleMeshService(
     }
 
     private fun buildDeduplicationKey(packet: BlemeshPacket): String {
-        return if (packet.type == MessageType.FRAGMENT.value && packet.payload.size >= 10) {
+        return if (packet.type == MessageType.FRAGMENT.value && packet.payload.size >= 13) {
             val fragmentID = packet.payload.take(8).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
             val index = ((packet.payload[8].toInt() and 0xFF) shl 8) or (packet.payload[9].toInt() and 0xFF)
             "${packet.senderId}-${packet.timestamp}-${packet.type}-$fragmentID-$index"
@@ -516,10 +536,63 @@ class BleMeshService(
     }
 
     private fun broadcastPacketExcluding(packet: BlemeshPacket, excludeAddress: String) {
-        val encoded = BinaryProtocol.encode(packet) ?: return
         for ((address, connection) in connectedPeers) {
             if (address != excludeAddress) {
-                writeToConnection(connection, encoded)
+                sendPacketToConnection(connection, packet)
+            }
+        }
+    }
+
+    /**
+     * Encode `packet` for `connection`. If the serialized size exceeds the
+     * connection's MTU budget, split into FRAGMENT packets (13-byte fragment
+     * payload header: [id:8][index:2 BE][total:2 BE][originalType:1]) matching
+     * the loxation-android / loxation-sw wire format.
+     *
+     * Each FRAGMENT wrapper uses this router's PeerID as sender and MAX_TTL so
+     * fragments can be relayed independently; reassembly recovers the inner
+     * packet's original sender/TTL.
+     */
+    private fun sendPacketToConnection(connection: PeerConnection, packet: BlemeshPacket) {
+        val encoded = BinaryProtocol.encode(packet) ?: return
+        val maxSingleWrite = (connection.mtu - 3).coerceIn(20, 185)
+
+        if (encoded.size <= maxSingleWrite) {
+            writeToConnection(connection, encoded)
+            return
+        }
+
+        val safeChunk = (maxSingleWrite - BLEMESH_PACKET_OVERHEAD - FRAGMENT_HEADER_BYTES).coerceAtLeast(20)
+        val fragments = fragmentationManager.split(encoded, packet.type, safeChunk)
+        val recipientFlag = if (!packet.isBroadcast) BlemeshPacket.FLAG_HAS_RECIPIENT else 0
+        val senderLong = myPeerID.toLongBE()
+
+        scope.launch {
+            for (fragment in fragments) {
+                val payload = java.io.ByteArrayOutputStream().apply {
+                    write(fragment.id)
+                    write((fragment.index shr 8) and 0xFF)
+                    write(fragment.index and 0xFF)
+                    write((fragment.total shr 8) and 0xFF)
+                    write(fragment.total and 0xFF)
+                    write(fragment.type.toInt() and 0xFF)
+                    write(fragment.payload)
+                }.toByteArray()
+
+                val fragmentPacket = BlemeshPacket(
+                    version = BlemeshPacket.PROTOCOL_VERSION,
+                    type = MessageType.FRAGMENT.value,
+                    ttl = BlemeshPacket.MAX_TTL.toByte(),
+                    timestamp = System.currentTimeMillis(),
+                    flags = recipientFlag,
+                    senderId = senderLong,
+                    recipientId = packet.recipientId,
+                    payload = payload,
+                    signature = null
+                )
+                val fragmentEncoded = BinaryProtocol.encode(fragmentPacket) ?: continue
+                writeToConnection(connection, fragmentEncoded)
+                delay(FRAGMENT_PACE_DELAY_MS)
             }
         }
     }
@@ -531,6 +604,7 @@ class BleMeshService(
         if (gatt != null && char != null) {
             // Client connection - write to remote characteristic
             try {
+                char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 char.value = data
                 gatt.writeCharacteristic(char)
             } catch (e: SecurityException) {

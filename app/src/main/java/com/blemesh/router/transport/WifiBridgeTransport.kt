@@ -96,6 +96,9 @@ class WifiBridgeTransport(
                 val socket = Socket()
                 socket.connect(InetSocketAddress(host, remotePort), 5000)
                 socket.tcpNoDelay = true
+                // OS-level keep-alive detects silently-dead TCP sessions (NAT timeouts,
+                // WiFi drops) without us needing to ship heartbeat frames.
+                socket.keepAlive = true
 
                 val conn = RouterConnection(
                     address = address,
@@ -172,6 +175,7 @@ class WifiBridgeTransport(
 
         try {
             socket.tcpNoDelay = true
+            socket.keepAlive = true
             val conn = RouterConnection(
                 address = remoteAddress,
                 socket = socket,

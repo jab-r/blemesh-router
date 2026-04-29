@@ -9,8 +9,10 @@ import kotlin.math.min
  * Splits encoded packets into MTU-sized fragments with 8-byte fragment ID for reassembly.
  * Ported from loxation-android BleMeshFragmentationManager.
  *
- * Fragment payload layout:
- *   [fragmentId:8][index:1][total:1][originalType:1][data:var]
+ * This class only produces `Fragment` slices; the caller writes them on the wire
+ * as the payload of a FRAGMENT (0x05) BlemeshPacket with layout:
+ *   [fragmentId:8][index:2 BE][total:2 BE][originalType:1][data:var]
+ * (13-byte fragment header, matching loxation-android / loxation-sw.)
  */
 class BleMeshFragmentationManager {
 

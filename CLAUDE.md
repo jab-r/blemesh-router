@@ -55,6 +55,17 @@ Offset  Field           Size    Type
 - `0x40` LOXATION_ANNOUNCE, `0x44` LOCATION_UPDATE
 - `0x60` REQUEST_SYNC (gossip)
 
+### FRAGMENT payload layout (13-byte header)
+
+```
+Offset  Field          Size   Type
+0       FragmentID     8      Random bytes, stable across a transfer
+8       Index          2      UInt16 big-endian (0-based)
+10      Total          2      UInt16 big-endian
+12      OriginalType   1      The MessageType of the reassembled inner packet
+13+     Data           Var    Slice of the inner encoded BlemeshPacket
+```
+
 ### Routing Rules
 
 - Relay decision: `shouldRelay()` checks packet type is relayable AND TTL > 1

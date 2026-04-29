@@ -43,16 +43,26 @@ class MeshRouterService : Service() {
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
 
-        /** Packet types that should be routed over WiFi (not just local relay). */
+        /**
+         * Packet types that should be routed over WiFi (not just local relay).
+         * UWB_RANGING is intentionally excluded — ranging is meaningful only
+         * within BLE radio range.
+         */
         private val ROUTABLE_TYPES: Set<Int> = setOf(
             MessageType.ANNOUNCE.value.toInt() and 0xFF,
+            MessageType.LEAVE.value.toInt() and 0xFF,
             MessageType.MESSAGE.value.toInt() and 0xFF,
             MessageType.FRAGMENT.value.toInt() and 0xFF,
             MessageType.DELIVERY_ACK.value.toInt() and 0xFF,
+            MessageType.DELIVERY_STATUS_REQUEST.value.toInt() and 0xFF,
             MessageType.READ_RECEIPT.value.toInt() and 0xFF,
             MessageType.NOISE_HANDSHAKE.value.toInt() and 0xFF,
             MessageType.NOISE_ENCRYPTED.value.toInt() and 0xFF,
+            MessageType.NOISE_IDENTITY_ANNOUNCE.value.toInt() and 0xFF,
             MessageType.LOXATION_ANNOUNCE.value.toInt() and 0xFF,
+            MessageType.LOXATION_QUERY.value.toInt() and 0xFF,
+            MessageType.LOXATION_CHUNK.value.toInt() and 0xFF,
+            MessageType.LOXATION_COMPLETE.value.toInt() and 0xFF,
             MessageType.LOCATION_UPDATE.value.toInt() and 0xFF,
             MessageType.MLS_MESSAGE.value.toInt() and 0xFF,
             MessageType.REQUEST_SYNC.value.toInt() and 0xFF,
