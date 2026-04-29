@@ -78,8 +78,7 @@ class MeshRouterService : Service() {
     private lateinit var myPeerID: PeerID
 
     private lateinit var bleMeshService: BleMeshService
-    private val transports = mutableListOf<RouterTransport>()
-    private lateinit var tcpBridge: WifiBridgeTransport
+    private lateinit var transports: List<RouterTransport>
 
     // Dedup for packets crossing the BLE↔bridge boundary
     private val bridgeDeduplicator = MessageDeduplicator(
@@ -100,9 +99,8 @@ class MeshRouterService : Service() {
         bleMeshService = BleMeshService(this, myPeerID, serviceScope)
         bleMeshService.packetListener = blePacketListener
 
-        tcpBridge = WifiBridgeTransport(serviceScope, myPeerID)
-        tcpBridge.listener = transportListener
-        transports.add(tcpBridge)
+        transports = TransportSelector.build(this, myPeerID, serviceScope)
+        for (t in transports) t.listener = transportListener
 
         INSTANCE = this
     }
@@ -117,14 +115,17 @@ class MeshRouterService : Service() {
         }
 
         intent?.getStringExtra(EXTRA_CONNECT_TO)?.let { connectList ->
-            for (entry in connectList.split(",")) {
-                val parts = entry.trim().split(":")
-                when (parts.size) {
-                    2 -> {
-                        val port = parts[1].toIntOrNull() ?: WifiBridgeTransport.DEFAULT_PORT
-                        tcpBridge.connectToHost(parts[0], port)
+            val tcp = transports.filterIsInstance<WifiBridgeTransport>().firstOrNull()
+            if (tcp != null) {
+                for (entry in connectList.split(",")) {
+                    val parts = entry.trim().split(":")
+                    when (parts.size) {
+                        2 -> {
+                            val port = parts[1].toIntOrNull() ?: WifiBridgeTransport.DEFAULT_PORT
+                            tcp.connectToHost(parts[0], port)
+                        }
+                        1 -> if (parts[0].isNotBlank()) tcp.connectToHost(parts[0])
                     }
-                    1 -> if (parts[0].isNotBlank()) tcpBridge.connectToHost(parts[0])
                 }
             }
         }
