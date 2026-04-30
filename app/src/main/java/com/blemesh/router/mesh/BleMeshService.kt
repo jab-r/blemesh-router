@@ -511,9 +511,23 @@ class BleMeshService(
         val peerID = derivePeerID(announcement.noisePublicKey)
 
         // Only map direct announces (max TTL = direct connection)
-        if ((packet.ttl.toInt() and 0xFF) == BlemeshPacket.MAX_TTL) {
-            addressToPeerID[fromAddress] = peerID
-            peerIdToAddress[peerID] = fromAddress
+        if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
+
+        // Evict any prior address for this peer. Loxation/iOS clients rotate
+        // their BLE resolvable private address every ~15 min, and dual-leg
+        // server+client connections to the same peer can surface under
+        // different addresses on Android's stack. Without eviction, the same
+        // PeerID accumulates under multiple address keys and getConnectedPeerIDs()
+        // reports the peer N times.
+        val priorAddress = peerIdToAddress[peerID]
+        if (priorAddress != null && priorAddress != fromAddress) {
+            addressToPeerID.remove(priorAddress)
+        }
+
+        val isNewMapping = addressToPeerID.put(fromAddress, peerID) != peerID
+        peerIdToAddress[peerID] = fromAddress
+
+        if (isNewMapping) {
             packetListener?.onPeerDiscovered(peerID, fromAddress)
             gossipSyncManager.scheduleInitialSyncToPeer(peerID)
         }

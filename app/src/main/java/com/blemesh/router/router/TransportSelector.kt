@@ -11,14 +11,22 @@ import kotlinx.coroutines.CoroutineScope
 /**
  * Builds the list of router-to-router transports to enable.
  *
- * Default policy: enable every transport whose hardware capability is
- * present. The bridge dedup at [MeshRouterService.bridgeDeduplicator]
- * prevents double-delivery if a packet arrives over more than one
- * transport. Hardware that misbehaves with concurrent Aware+Direct can
- * be handled by a future build-time toggle here.
+ * Policy:
+ *  - TCP-over-LAN is always included (no hardware dependency beyond plain
+ *    Wi-Fi networking; useful whenever routers share infrastructure Wi-Fi).
+ *  - Wi-Fi Aware is included when hardware supports it. Strictly better than
+ *    Direct on hardware that has both — clean N:N mesh, no Group Owner
+ *    bottleneck, deterministic role assignment.
+ *  - Wi-Fi Direct is included only as a fallback, when Aware is unavailable.
+ *    On Pixel chipsets, running Aware and Direct concurrently causes the
+ *    P2P stack's NAN-iface allocation to fail every discovery cycle (logged
+ *    as `HalDevMgr E createIfaceIfPossible: Failed to create iface for
+ *    ifaceType=3` every 30 s) because the NAN iface is already held by Aware.
+ *    Skipping Direct in that case is the cleanest fix.
  *
- * The TCP-over-LAN transport is always included — it has no hardware
- * dependency beyond plain Wi-Fi networking.
+ * Cross-transport packet duplicates are dropped by [MeshRouterService]'s
+ * bridge dedup, so a router reachable via multiple transports won't deliver
+ * twice.
  */
 object TransportSelector {
 
@@ -28,14 +36,14 @@ object TransportSelector {
         scope: CoroutineScope
     ): List<RouterTransport> {
         val transports = mutableListOf<RouterTransport>()
-        // TCP-over-LAN: always available, useful when routers share infrastructure Wi-Fi.
+        // TCP-over-LAN: always available.
         transports.add(WifiBridgeTransport(scope, localPeerID))
-        // Wi-Fi Aware: API 26+, requires hardware. Preferred for ad-hoc N:N mesh.
-        if (WifiAwareTransport.isAvailable(context)) {
+
+        val awareAvailable = WifiAwareTransport.isAvailable(context)
+        if (awareAvailable) {
             transports.add(WifiAwareTransport(context, localPeerID))
-        }
-        // Wi-Fi Direct: broader hardware support but single-group topology.
-        if (WifiDirectTransport.isAvailable(context)) {
+        } else if (WifiDirectTransport.isAvailable(context)) {
+            // Direct only as a fallback when Aware is missing.
             transports.add(WifiDirectTransport(context, localPeerID))
         }
         return transports

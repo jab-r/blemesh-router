@@ -50,7 +50,11 @@ class WifiNetworkApplicator(private val context: Context) {
 
     fun clear() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        wifiManager?.removeNetworkSuggestions(emptyList())
+        val mgr = wifiManager ?: return
+        // No-op (and avoid the noisy "No network suggestions found" framework
+        // ERROR log) if we have nothing currently installed.
+        if (mgr.networkSuggestions.isEmpty()) return
+        mgr.removeNetworkSuggestions(emptyList())
     }
 
     companion object {

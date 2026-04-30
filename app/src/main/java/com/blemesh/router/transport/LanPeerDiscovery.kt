@@ -87,7 +87,10 @@ class LanPeerDiscovery(private val context: Context) {
         }
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
-                Log.i(TAG, "Registered NSD service '${serviceInfo.serviceName}' on port ${serviceInfo.port}")
+                // Note: `serviceInfo.port` from the callback is sometimes 0 on
+                // Android even though the published mDNS record carries the
+                // value we set. Log our intended listenPort to avoid confusion.
+                Log.i(TAG, "Registered NSD service '${serviceInfo.serviceName}' on port $listenPort")
             }
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                 Log.w(TAG, "NSD registration failed: $errorCode")
