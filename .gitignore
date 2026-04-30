@@ -11,3 +11,6 @@ captures/
 *.aab
 *.keystore
 !gradle-wrapper.jar
+
+# Field debug logs
+*.log
