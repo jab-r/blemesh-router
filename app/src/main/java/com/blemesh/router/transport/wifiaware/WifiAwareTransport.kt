@@ -39,6 +39,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Wi-Fi Aware (NAN) router-to-router transport.
@@ -48,15 +49,28 @@ import java.util.concurrent.ConcurrentHashMap
  *    -> WifiAwareManager.attach -> WifiAwareSession
  *    -> publish service "blemesh-router-v1" with our PeerID in serviceSpecificInfo
  *    -> subscribe to the same service
+ *
+ * Role assignment uses lexicographic PeerID order; the larger PeerID is the
+ * NDP data-path server (and must be the Aware *publisher* on this connection,
+ * because setPort/setTransportProtocol on WifiAwareNetworkSpecifier are
+ * publisher-only). The flow:
+ *
  *  on subscribe.onServiceDiscovered(peerHandle, serviceSpecificInfo):
- *    -> peer's PeerID = decode(serviceSpecificInfo)
- *    -> deterministic role: lexicographically-greater PeerID is server
- *    -> server: build NetworkSpecifier with port, ConnectivityManager.requestNetwork
- *               on onAvailable -> ServerSocket.accept
- *    -> client: build NetworkSpecifier without port
- *               on onCapabilitiesChanged -> dial WifiAwareNetworkInfo.peerIpv6Addr:port
+ *    decode peer PeerID
+ *    if localPeerID < peerID  -> we are the client:
+ *        sendMessage(peerHandle, localPeerID) on subscribeSession to wake
+ *        the peer's publish-session onMessageReceived
+ *        build NetworkSpecifier from subscribeSession (no port, no protocol)
+ *        requestNetwork; on onCapabilitiesChanged dial
+ *        WifiAwareNetworkInfo.peerIpv6Addr:port
+ *    else                     -> ignore; peer will contact us via publish
+ *  on publish.onMessageReceived(peerHandle, message):
+ *    decode peer PeerID from message; we are the server (localPeerID > peerID)
+ *    open ServerSocket(0)
+ *    build NetworkSpecifier from publishSession with setPort + IPPROTO_TCP
+ *    requestNetwork; on onAvailable accept()
  *  on socket connected:
- *    -> length-prefixed read loop -> listener.onTransportPacketReceived
+ *    length-prefixed read loop -> listener.onTransportPacketReceived
  *
  * Identity binding is eager: serviceSpecificInfo carries the 8-byte raw PeerID,
  * so we know the peer's identity before any data flows.
@@ -64,8 +78,10 @@ import java.util.concurrent.ConcurrentHashMap
  * Limitations of this initial implementation (untested in this repo):
  *  - No retry on attach/publish/subscribe failure; restart the service to recover.
  *  - No reconnect on transient network loss.
- *  - Open data path (no PSK) — depends on framework default. Routers within
- *    a deployment are assumed to trust each other.
+ *  - Shared static PSK on the NDP link. Android requires a secure link when
+ *    setPort/setTransportProtocol are used, so we cannot use an open link.
+ *    The PSK is a constant baked into the app — routers within a deployment
+ *    are assumed to trust each other.
  */
 @SuppressLint("MissingPermission")
 class WifiAwareTransport(
@@ -101,6 +117,7 @@ class WifiAwareTransport(
     }
 
     private val peers = ConcurrentHashMap<PeerID, PeerLink>()
+    private val nextMessageId = AtomicInteger(1)
     @Volatile private var running = false
 
     // --- RouterTransport ---
@@ -176,6 +193,9 @@ class WifiAwareTransport(
                 publishSession = s
                 Log.d(TAG, "Aware publish started")
             }
+            override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
+                handlePublishMessage(peerHandle, message)
+            }
         }, handler)
     }
 
@@ -210,18 +230,48 @@ class WifiAwareTransport(
         if (peerID == localPeerID) return
         if (peers.containsKey(peerID)) return
 
-        val isServer = localPeerID.rawValue > peerID.rawValue
-        val link = PeerLink(peerHandle, peerID, isServer)
-        peers[peerID] = link
+        // Only the lower-PeerID side initiates from subscribe. The higher side
+        // will be notified via its publish-session onMessageReceived.
+        if (localPeerID.rawValue >= peerID.rawValue) return
 
-        Log.d(TAG, "Aware discovered ${peerID.rawValue.take(8)} (role=${if (isServer) "server" else "client"})")
-        if (isServer) startServerSide(link) else startClientSide(link)
+        val sub = subscribeSession ?: return
+        val link = PeerLink(peerHandle, peerID, isServer = false)
+        peers[peerID] = link
+        Log.d(TAG, "Aware discovered ${peerID.rawValue.take(8)} (role=client)")
+
+        val ourId = localPeerID.toBytes()
+        if (ourId == null) {
+            tearDownLink(link); return
+        }
+        try {
+            sub.sendMessage(peerHandle, nextMessageId.getAndIncrement(), ourId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Aware sendMessage to peer failed: ${e.message}")
+            tearDownLink(link); return
+        }
+        startClientSide(link)
+    }
+
+    private fun handlePublishMessage(peerHandle: PeerHandle, message: ByteArray) {
+        if (message.size != 8) return
+        val peerID = PeerID.fromBytes(message) ?: return
+        if (peerID == localPeerID) return
+        if (peers.containsKey(peerID)) return
+        // We must be the higher-PeerID side to act as server.
+        if (localPeerID.rawValue <= peerID.rawValue) return
+
+        val link = PeerLink(peerHandle, peerID, isServer = true)
+        peers[peerID] = link
+        Log.d(TAG, "Aware connect-request from ${peerID.rawValue.take(8)} (role=server)")
+        startServerSide(link)
     }
 
     // --- NDP server side ---
 
     private fun startServerSide(link: PeerLink) {
-        val sub = subscribeSession ?: return
+        // Server (publisher) side: setPort/setTransportProtocol require a
+        // PublishDiscoverySession-built specifier per Android NDP contract.
+        val pub = publishSession ?: run { tearDownLink(link); return }
         val server = try {
             ServerSocket(0).also { it.reuseAddress = true }
         } catch (_: Exception) {
@@ -230,7 +280,8 @@ class WifiAwareTransport(
         link.serverSocket = server
         val port = server.localPort
 
-        val specifier = WifiAwareNetworkSpecifier.Builder(sub, link.peerHandle)
+        val specifier = WifiAwareNetworkSpecifier.Builder(pub, link.peerHandle)
+            .setPskPassphrase(DATA_PATH_PSK)
             .setPort(port)
             .setTransportProtocol(IPPROTO_TCP)
             .build()
@@ -267,9 +318,11 @@ class WifiAwareTransport(
     // --- NDP client side ---
 
     private fun startClientSide(link: PeerLink) {
+        // Client (subscriber) side: must NOT call setPort or setTransportProtocol.
+        // The port arrives via WifiAwareNetworkInfo on onCapabilitiesChanged.
         val sub = subscribeSession ?: return
         val specifier = WifiAwareNetworkSpecifier.Builder(sub, link.peerHandle)
-            .setTransportProtocol(IPPROTO_TCP)
+            .setPskPassphrase(DATA_PATH_PSK)
             .build()
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI_AWARE)
@@ -378,6 +431,10 @@ class WifiAwareTransport(
         const val MAX_PACKET = 64 * 1024
         // IPPROTO_TCP from posix; WifiAwareNetworkSpecifier expects this raw int.
         private const val IPPROTO_TCP = 6
+        // Static PSK satisfies Android's "secure link" requirement when
+        // setPort/setTransportProtocol are used. Same string on every router
+        // in the deployment.
+        private const val DATA_PATH_PSK = "blemesh-router-aware-v1"
 
         fun isAvailable(context: Context): Boolean {
             val pm = context.packageManager

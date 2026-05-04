@@ -178,9 +178,10 @@ class BleMeshService(
 
     /** Inject a packet received from WiFi bridge into the local BLE mesh. */
     fun injectPacketFromWifi(packet: BlemeshPacket) {
-        // Validate
-        val packetId = "${packet.senderId}-${packet.timestamp}-${packet.type}"
-        if (deduplicator.isDuplicate(packetId)) return
+        // Use the same fragment-aware dedup key as the BLE inbound path so
+        // that a FRAGMENT arriving via WiFi and the same FRAGMENT arriving
+        // via BLE collide on a single key (sender-ts-type-fragmentID-index).
+        if (deduplicator.isDuplicate(buildDeduplicationKey(packet))) return
 
         Log.d(TAG, "Injecting WiFi packet type=0x${"%02x".format(packet.type)} into BLE mesh")
 

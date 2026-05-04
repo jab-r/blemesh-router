@@ -38,7 +38,8 @@ class WifiBridgeTransport(
         private const val MAX_PACKET_SIZE = 65536
         private const val HANDSHAKE_VERSION: Byte = 0x01
         private const val HANDSHAKE_TIMEOUT_MS = 5000
-        private const val RECONNECT_DELAY_MS = 5000L
+        private const val INITIAL_RECONNECT_DELAY_MS = 5_000L
+        private const val MAX_RECONNECT_DELAY_MS = 300_000L
     }
 
     override val name: String = "tcp"
@@ -104,32 +105,34 @@ class WifiBridgeTransport(
     fun connectToHost(host: String, remotePort: Int = port) {
         scope.launch(Dispatchers.IO) {
             val target = "$host:$remotePort"
-            try {
-                Log.d(TAG, "Connecting to router at $target")
-                val socket = Socket().apply {
-                    connect(InetSocketAddress(host, remotePort), 5000)
-                    tcpNoDelay = true
-                    keepAlive = true
-                    soTimeout = HANDSHAKE_TIMEOUT_MS
-                }
-                val output = DataOutputStream(socket.getOutputStream())
-                val input = DataInputStream(socket.getInputStream())
+            var delayMs = INITIAL_RECONNECT_DELAY_MS
+            while (isRunning) {
+                try {
+                    Log.d(TAG, "Connecting to router at $target")
+                    val socket = Socket().apply {
+                        connect(InetSocketAddress(host, remotePort), 5000)
+                        tcpNoDelay = true
+                        keepAlive = true
+                        soTimeout = HANDSHAKE_TIMEOUT_MS
+                    }
+                    val output = DataOutputStream(socket.getOutputStream())
+                    val input = DataInputStream(socket.getInputStream())
 
-                writeHandshake(output)
-                val remotePeer = readHandshake(input)
-                if (remotePeer == null) {
-                    Log.w(TAG, "Handshake failed with $target")
-                    try { socket.close() } catch (_: Exception) { }
-                    return@launch
+                    writeHandshake(output)
+                    val remotePeer = readHandshake(input)
+                    if (remotePeer == null) {
+                        Log.w(TAG, "Handshake failed with $target")
+                        try { socket.close() } catch (_: Exception) { }
+                    } else {
+                        socket.soTimeout = 0
+                        registerConnection(remotePeer, socket, output, input)
+                        return@launch
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to connect to $target: ${e.message}")
                 }
-                socket.soTimeout = 0
-                registerConnection(remotePeer, socket, output, input)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to connect to $target: ${e.message}")
-                if (isRunning) {
-                    delay(RECONNECT_DELAY_MS)
-                    connectToHost(host, remotePort)
-                }
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
             }
         }
     }
