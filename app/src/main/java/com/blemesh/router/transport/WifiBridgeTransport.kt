@@ -46,6 +46,7 @@ class WifiBridgeTransport(
     override var listener: RouterTransport.Listener? = null
 
     private val connections = ConcurrentHashMap<PeerID, RouterConnection>()
+    private val dialTargets = ConcurrentHashMap<String, Job>()
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private var isRunning = false
@@ -55,6 +56,7 @@ class WifiBridgeTransport(
         val socket: Socket,
         val output: DataOutputStream,
         val input: DataInputStream,
+        val isOutbound: Boolean,
         var readJob: Job? = null
     )
 
@@ -73,6 +75,8 @@ class WifiBridgeTransport(
         if (!isRunning) return
         isRunning = false
         serverJob?.cancel()
+        for (job in dialTargets.values) job.cancel()
+        dialTargets.clear()
         for (peerID in connections.keys.toList()) {
             disconnectPeer(peerID)
         }
@@ -101,40 +105,77 @@ class WifiBridgeTransport(
     /**
      * Dial a remote router by host:port. The peer's PeerID is learned via
      * the post-connect handshake; the connection is then registered.
+     *
+     * Persistent: if the connection is dropped (or lost to dedup), the loop
+     * waits for whichever connection is still live to end and re-dials with
+     * exponential backoff. A single dialer Job per `host:port` is kept in
+     * [dialTargets].
      */
     fun connectToHost(host: String, remotePort: Int = port) {
-        scope.launch(Dispatchers.IO) {
-            val target = "$host:$remotePort"
+        val target = "$host:$remotePort"
+        if (!isRunning) return
+        if (dialTargets.containsKey(target)) return
+        val job = scope.launch(Dispatchers.IO) {
             var delayMs = INITIAL_RECONNECT_DELAY_MS
-            while (isRunning) {
-                try {
-                    Log.d(TAG, "Connecting to router at $target")
-                    val socket = Socket().apply {
-                        connect(InetSocketAddress(host, remotePort), 5000)
-                        tcpNoDelay = true
-                        keepAlive = true
-                        soTimeout = HANDSHAKE_TIMEOUT_MS
+            try {
+                while (isRunning && isActive) {
+                    val waited = dialOnce(host, remotePort, target)
+                    if (waited) {
+                        // Connection lived for at least one read cycle; reset backoff.
+                        delayMs = INITIAL_RECONNECT_DELAY_MS
                     }
-                    val output = DataOutputStream(socket.getOutputStream())
-                    val input = DataInputStream(socket.getInputStream())
-
-                    writeHandshake(output)
-                    val remotePeer = readHandshake(input)
-                    if (remotePeer == null) {
-                        Log.w(TAG, "Handshake failed with $target")
-                        try { socket.close() } catch (_: Exception) { }
-                    } else {
-                        socket.soTimeout = 0
-                        registerConnection(remotePeer, socket, output, input)
-                        return@launch
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to connect to $target: ${e.message}")
+                    if (!isRunning) break
+                    delay(delayMs)
+                    delayMs = (delayMs * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
                 }
-                delay(delayMs)
-                delayMs = (delayMs * 2).coerceAtMost(MAX_RECONNECT_DELAY_MS)
+            } finally {
+                dialTargets.remove(target)
             }
         }
+        dialTargets[target] = job
+    }
+
+    /** Returns true if a connection was successfully established (and later torn down). */
+    private suspend fun dialOnce(host: String, remotePort: Int, target: String): Boolean {
+        val socket = try {
+            Log.d(TAG, "Connecting to router at $target")
+            Socket().apply {
+                connect(InetSocketAddress(host, remotePort), 5000)
+                tcpNoDelay = true
+                keepAlive = true
+                soTimeout = HANDSHAKE_TIMEOUT_MS
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to connect to $target: ${e.message}")
+            return false
+        }
+        val output: DataOutputStream
+        val input: DataInputStream
+        val remotePeer: PeerID?
+        try {
+            output = DataOutputStream(socket.getOutputStream())
+            input = DataInputStream(socket.getInputStream())
+            writeHandshake(output)
+            remotePeer = readHandshake(input)
+        } catch (e: Exception) {
+            Log.w(TAG, "Handshake error with $target: ${e.message}")
+            try { socket.close() } catch (_: Exception) { }
+            return false
+        }
+        if (remotePeer == null) {
+            Log.w(TAG, "Handshake failed with $target")
+            try { socket.close() } catch (_: Exception) { }
+            return false
+        }
+        try { socket.soTimeout = 0 } catch (_: Exception) { }
+
+        // registerConnection either accepts this socket (returns its readJob)
+        // or rejects it on dedup (returns the kept connection's readJob, if any).
+        // Either way, block until that connection ends so we don't immediately
+        // re-dial while the survivor is still alive.
+        val activeJob = registerConnection(remotePeer, socket, output, input, isOutbound = true)
+        activeJob?.join()
+        return true
     }
 
     // --- Server ---
@@ -172,7 +213,7 @@ class WifiBridgeTransport(
                     return@launch
                 }
                 socket.soTimeout = 0
-                registerConnection(remotePeer, socket, output, input)
+                registerConnection(remotePeer, socket, output, input, isOutbound = false)
             } catch (e: Exception) {
                 Log.w(TAG, "Inbound connection from $remoteAddr failed: ${e.message}")
                 try { socket.close() } catch (_: Exception) { }
@@ -202,42 +243,90 @@ class WifiBridgeTransport(
         return PeerID.fromBytes(peerBytes)
     }
 
+    /**
+     * Register a freshly handshaken socket. Returns the read [Job] of the
+     * connection that is alive after this call (whichever side won the
+     * dedup tie-break), or `null` if no connection is alive (self-loop or
+     * unrecoverable error).
+     *
+     * Tie-break rule (symmetric across both peers): when both ends dial each
+     * other concurrently, both keep the socket where the **smaller PeerID
+     * is the dialer**. Equivalently:
+     *   - the side with the smaller PeerID keeps its outbound
+     *   - the side with the larger  PeerID keeps its inbound
+     * which is the same TCP socket. The other socket is closed by both ends.
+     *
+     * The previous logic was asymmetric ("smaller-PeerID side keeps the
+     * 'existing' connection regardless of direction"), so under a true
+     * simultaneous-dial the two sides closed different sockets and both
+     * peers lost the bridge.
+     */
     private fun registerConnection(
         remotePeer: PeerID,
         socket: Socket,
         output: DataOutputStream,
-        input: DataInputStream
-    ) {
+        input: DataInputStream,
+        isOutbound: Boolean
+    ): Job? {
         if (remotePeer == localPeerID) {
             Log.w(TAG, "Refusing self-connection ${remotePeer.rawValue.take(8)}")
             try { socket.close() } catch (_: Exception) { }
-            return
+            return null
         }
-        // If we already have a connection to this peer, drop the duplicate.
-        // Deterministic tie-break: keep the one initiated by the smaller PeerID.
-        val existing = connections[remotePeer]
-        if (existing != null) {
-            val keepNew = localPeerID.rawValue < remotePeer.rawValue
-            if (!keepNew) {
-                Log.d(TAG, "Duplicate connection to ${remotePeer.rawValue.take(8)}; keeping existing")
-                try { socket.close() } catch (_: Exception) { }
-                return
-            }
-            disconnectPeer(remotePeer)
-        }
+        // Direction (inbound vs outbound) that wins the tie-break.
+        val outboundWins = localPeerID.rawValue < remotePeer.rawValue
+        val newWins = (isOutbound == outboundWins)
 
-        val conn = RouterConnection(remotePeer, socket, output, input)
-        connections[remotePeer] = conn
-        conn.readJob = startReading(conn)
-        listener?.onTransportPeerConnected(this, remotePeer)
-        Log.i(TAG, "Connected to router peer ${remotePeer.rawValue.take(8)}")
+        synchronized(connections) {
+            val existing = connections[remotePeer]
+            if (existing != null) {
+                if (!newWins) {
+                    Log.d(TAG, "Duplicate connection to ${remotePeer.rawValue.take(8)} (new=${if (isOutbound) "out" else "in"}); keeping existing (${if (existing.isOutbound) "out" else "in"})")
+                    try { socket.close() } catch (_: Exception) { }
+                    return existing.readJob
+                }
+                Log.d(TAG, "Duplicate connection to ${remotePeer.rawValue.take(8)}; replacing existing (${if (existing.isOutbound) "out" else "in"}) with new (${if (isOutbound) "out" else "in"})")
+                // Remove the existing entry now so the read-loop's finally
+                // (running on cancel) doesn't see itself in the map and won't
+                // fire onTransportPeerDisconnected -- the new conn replaces it.
+                connections.remove(remotePeer)
+                existing.readJob?.cancel()
+                try { existing.socket.close() } catch (_: Exception) { }
+            }
+
+            val conn = RouterConnection(remotePeer, socket, output, input, isOutbound)
+            connections[remotePeer] = conn
+            conn.readJob = startReading(conn)
+            listener?.onTransportPeerConnected(this, remotePeer)
+            Log.i(TAG, "Connected to router peer ${remotePeer.rawValue.take(8)} (${if (isOutbound) "outbound" else "inbound"})")
+            return conn.readJob
+        }
     }
 
     private fun disconnectPeer(peerID: PeerID) {
-        val conn = connections.remove(peerID) ?: return
+        val conn: RouterConnection
+        synchronized(connections) {
+            conn = connections.remove(peerID) ?: return
+        }
         conn.readJob?.cancel()
         try { conn.socket.close() } catch (_: Exception) { }
         listener?.onTransportPeerDisconnected(this, peerID)
+    }
+
+    /**
+     * Identity-checked disconnect used by the read loop's `finally`: only
+     * evicts the map entry if it still points at this specific connection,
+     * so a connection that was already superseded by [registerConnection]
+     * does not accidentally drop its replacement.
+     */
+    private fun disconnectConnection(conn: RouterConnection) {
+        val wasActive: Boolean
+        synchronized(connections) {
+            wasActive = connections[conn.peerID] === conn
+            if (wasActive) connections.remove(conn.peerID)
+        }
+        try { conn.socket.close() } catch (_: Exception) { }
+        if (wasActive) listener?.onTransportPeerDisconnected(this, conn.peerID)
     }
 
     // --- Read loop ---
@@ -261,7 +350,7 @@ class WifiBridgeTransport(
             } catch (e: Exception) {
                 if (isRunning) Log.d(TAG, "Read loop ended for ${conn.peerID.rawValue.take(8)}: ${e.message}")
             } finally {
-                disconnectPeer(conn.peerID)
+                disconnectConnection(conn)
             }
         }
     }
@@ -278,7 +367,7 @@ class WifiBridgeTransport(
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Send to ${conn.peerID.rawValue.take(8)} failed: ${e.message}")
-                disconnectPeer(conn.peerID)
+                disconnectConnection(conn)
             }
         }
     }
