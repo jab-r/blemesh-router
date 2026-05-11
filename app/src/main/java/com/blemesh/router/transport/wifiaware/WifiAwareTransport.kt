@@ -30,6 +30,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
@@ -114,11 +115,21 @@ class WifiAwareTransport(
         @Volatile var socket: Socket? = null
         @Volatile var readJob: Job? = null
         @Volatile var networkCallback: ConnectivityManager.NetworkCallback? = null
+        @Volatile var establishStartMs: Long = 0L
+        // Monotonic: false -> true exactly once when the socket is published.
+        // Guarded by synchronized(this) when paired with watchdog reads.
+        @Volatile var established: Boolean = false
+        @Volatile var watchdog: Job? = null
     }
 
     private val peers = ConcurrentHashMap<PeerID, PeerLink>()
     private val nextMessageId = AtomicInteger(1)
+    // msgId -> peer the wake-up message was addressed to. Used by the subscribe
+    // session's onMessageSendSucceeded/Failed callbacks to log which peer.
+    private val pendingMessageIds = ConcurrentHashMap<Int, PeerID>()
     @Volatile private var running = false
+
+    private fun shortId(p: PeerID): String = p.rawValue.take(8)
 
     // --- RouterTransport ---
 
@@ -196,6 +207,19 @@ class WifiAwareTransport(
             override fun onMessageReceived(peerHandle: PeerHandle, message: ByteArray) {
                 handlePublishMessage(peerHandle, message)
             }
+            override fun onSessionTerminated() {
+                Log.w(TAG, "publishSession terminated; tearing down server-role links and restarting publish")
+                publishSession = null
+                for (link in peers.values.toList()) {
+                    if (link.isServer) tearDownLink(link)
+                }
+                if (running) handler.post { startPublish() }
+            }
+            override fun onSessionConfigFailed() {
+                Log.w(TAG, "publish onSessionConfigFailed; will retry")
+                publishSession = null
+                if (running) handler.post { startPublish() }
+            }
         }, handler)
     }
 
@@ -221,6 +245,30 @@ class WifiAwareTransport(
                 val match = peers.values.firstOrNull { it.peerHandle == peerHandle }
                 if (match != null) tearDownLink(match)
             }
+            override fun onMessageSendSucceeded(messageId: Int) {
+                val peerID = pendingMessageIds.remove(messageId) ?: return
+                Log.d(TAG, "Aware sendMessage delivered peer=${shortId(peerID)} msgId=$messageId")
+            }
+            override fun onMessageSendFailed(messageId: Int) {
+                val peerID = pendingMessageIds.remove(messageId)
+                Log.w(TAG, "Aware sendMessage onMessageSendFailed peer=${peerID?.let { shortId(it) } ?: "?"} msgId=$messageId (watchdog will tear down if NDP doesn't establish)")
+                // Do not tear down here -- the watchdog is the authoritative timeout,
+                // and Android sometimes reports onMessageSendFailed for messages the
+                // peer actually received.
+            }
+            override fun onSessionTerminated() {
+                Log.w(TAG, "subscribeSession terminated; tearing down client-role links and restarting subscribe")
+                subscribeSession = null
+                for (link in peers.values.toList()) {
+                    if (!link.isServer) tearDownLink(link)
+                }
+                if (running) handler.post { startSubscribe() }
+            }
+            override fun onSessionConfigFailed() {
+                Log.w(TAG, "subscribe onSessionConfigFailed; will retry")
+                subscribeSession = null
+                if (running) handler.post { startSubscribe() }
+            }
         }, handler)
     }
 
@@ -237,17 +285,36 @@ class WifiAwareTransport(
         val sub = subscribeSession ?: return
         val link = PeerLink(peerHandle, peerID, isServer = false)
         peers[peerID] = link
-        Log.d(TAG, "Aware discovered ${peerID.rawValue.take(8)} (role=client)")
+        Log.d(TAG, "Aware discovered ${shortId(peerID)} (role=client) peerHandle=$peerHandle")
 
         val ourId = localPeerID.toBytes()
         if (ourId == null) {
             tearDownLink(link); return
         }
-        try {
-            sub.sendMessage(peerHandle, nextMessageId.getAndIncrement(), ourId)
-        } catch (e: Exception) {
-            Log.w(TAG, "Aware sendMessage to peer failed: ${e.message}")
-            tearDownLink(link); return
+
+        // Retry the wake-up send a few times off the Aware HandlerThread.
+        // Eager call to startClientSide(): the NAN follow-up is small and
+        // usually delivers within tens of ms; blocking NDP setup behind ack
+        // adds latency on the happy path. If the message is lost the watchdog
+        // tears down the link and the next onServiceDiscovered retries.
+        val msgId = nextMessageId.getAndIncrement()
+        pendingMessageIds[msgId] = peerID
+        scope.launch {
+            var sendOk = false
+            for (attempt in 0..MSG_SEND_RETRIES) {
+                try {
+                    sub.sendMessage(peerHandle, msgId, ourId)
+                    sendOk = true
+                    break
+                } catch (e: Exception) {
+                    Log.w(TAG, "Aware sendMessage attempt=$attempt peer=${shortId(peerID)} err=${e.message}")
+                    if (attempt < MSG_SEND_RETRIES) delay(MSG_SEND_RETRY_DELAY_MS)
+                }
+            }
+            if (!sendOk) {
+                pendingMessageIds.remove(msgId)
+                handler.post { tearDownLink(link) }
+            }
         }
         startClientSide(link)
     }
@@ -262,7 +329,7 @@ class WifiAwareTransport(
 
         val link = PeerLink(peerHandle, peerID, isServer = true)
         peers[peerID] = link
-        Log.d(TAG, "Aware connect-request from ${peerID.rawValue.take(8)} (role=server)")
+        Log.d(TAG, "Aware connect-request from ${shortId(peerID)} (role=server) peerHandle=$peerHandle")
         startServerSide(link)
     }
 
@@ -292,25 +359,51 @@ class WifiAwareTransport(
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.i(TAG, "NDP onAvailable SERVER peer=${shortId(link.peerID)} +${delta}ms network=$network")
                 link.network = network
                 scope.launch {
+                    val acceptStart = System.currentTimeMillis()
                     try {
                         val sock = server.accept()
-                        link.socket = sock
+                        Log.i(TAG, "server.accept returned peer=${shortId(link.peerID)} +${System.currentTimeMillis() - acceptStart}ms remote=${sock.inetAddress}")
+                        synchronized(link) {
+                            link.established = true
+                            link.socket = sock
+                        }
+                        link.watchdog?.cancel()
+                        link.watchdog = null
                         listener?.onTransportPeerConnected(this@WifiAwareTransport, link.peerID)
                         startReadLoop(link)
-                    } catch (_: Exception) {
-                        tearDownLink(link)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "server.accept failed peer=${shortId(link.peerID)} err=${e.message}")
+                        handler.post { tearDownLink(link) }
                     }
                 }
             }
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                val info = caps.transportInfo as? WifiAwareNetworkInfo
+                Log.d(TAG, "NDP onCapabilitiesChanged SERVER peer=${shortId(link.peerID)} ip=${info?.peerIpv6Addr} port=${info?.port}")
+            }
             override fun onLost(network: Network) {
-                tearDownLink(link)
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.w(TAG, "NDP onLost SERVER peer=${shortId(link.peerID)} +${delta}ms")
+                handler.post { tearDownLink(link) }
+            }
+            override fun onUnavailable() {
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.w(TAG, "NDP onUnavailable SERVER peer=${shortId(link.peerID)} +${delta}ms (framework declared request unfulfillable)")
+                handler.post { tearDownLink(link) }
             }
         }
         link.networkCallback = cb
-        try { connectivityMgr.requestNetwork(request, cb) } catch (e: Exception) {
-            Log.w(TAG, "requestNetwork (server) failed: ${e.message}")
+        link.establishStartMs = System.currentTimeMillis()
+        Log.i(TAG, "requestNetwork SERVER peer=${shortId(link.peerID)} port=$port proto=TCP")
+        try {
+            connectivityMgr.requestNetwork(request, cb)
+            armWatchdog(link)
+        } catch (e: Exception) {
+            Log.w(TAG, "requestNetwork (server) failed peer=${shortId(link.peerID)} err=${e.message}")
             tearDownLink(link)
         }
     }
@@ -331,33 +424,81 @@ class WifiAwareTransport(
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             @Volatile private var dialed = false
+            override fun onAvailable(network: Network) {
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.i(TAG, "NDP onAvailable CLIENT peer=${shortId(link.peerID)} +${delta}ms network=$network")
+            }
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                 if (dialed) return
                 val info = caps.transportInfo as? WifiAwareNetworkInfo ?: return
                 val peerIp: InetAddress = info.peerIpv6Addr ?: return
                 val peerPort = info.port
                 if (peerPort <= 0) return
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.i(TAG, "NDP onCapabilitiesChanged CLIENT peer=${shortId(link.peerID)} ip=$peerIp port=$peerPort +${delta}ms")
                 dialed = true
                 link.network = network
                 scope.launch {
+                    val dialStart = System.currentTimeMillis()
                     try {
                         val sock = network.socketFactory.createSocket(peerIp, peerPort)
-                        link.socket = sock
+                        Log.i(TAG, "client connect returned peer=${shortId(link.peerID)} +${System.currentTimeMillis() - dialStart}ms")
+                        synchronized(link) {
+                            link.established = true
+                            link.socket = sock
+                        }
+                        link.watchdog?.cancel()
+                        link.watchdog = null
                         listener?.onTransportPeerConnected(this@WifiAwareTransport, link.peerID)
                         startReadLoop(link)
-                    } catch (_: Exception) {
-                        tearDownLink(link)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "client connect failed peer=${shortId(link.peerID)} err=${e.message}")
+                        handler.post { tearDownLink(link) }
                     }
                 }
             }
             override fun onLost(network: Network) {
-                tearDownLink(link)
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.w(TAG, "NDP onLost CLIENT peer=${shortId(link.peerID)} +${delta}ms")
+                handler.post { tearDownLink(link) }
+            }
+            override fun onUnavailable() {
+                val delta = System.currentTimeMillis() - link.establishStartMs
+                Log.w(TAG, "NDP onUnavailable CLIENT peer=${shortId(link.peerID)} +${delta}ms (framework declared request unfulfillable)")
+                handler.post { tearDownLink(link) }
             }
         }
         link.networkCallback = cb
-        try { connectivityMgr.requestNetwork(request, cb) } catch (e: Exception) {
-            Log.w(TAG, "requestNetwork (client) failed: ${e.message}")
+        link.establishStartMs = System.currentTimeMillis()
+        Log.i(TAG, "requestNetwork CLIENT peer=${shortId(link.peerID)} (port arrives via peer info)")
+        try {
+            connectivityMgr.requestNetwork(request, cb)
+            armWatchdog(link)
+        } catch (e: Exception) {
+            Log.w(TAG, "requestNetwork (client) failed peer=${shortId(link.peerID)} err=${e.message}")
             tearDownLink(link)
+        }
+    }
+
+    /**
+     * Per-link watchdog. Tears down a PeerLink if NDP hasn't established within
+     * [NDP_ESTABLISH_TIMEOUT_MS]. Without this, a stuck requestNetwork leaves us
+     * waiting ~51s for the framework's own eviction, with no signal to retry.
+     */
+    private fun armWatchdog(link: PeerLink) {
+        link.watchdog = scope.launch {
+            delay(NDP_ESTABLISH_TIMEOUT_MS)
+            val shouldTearDown: Boolean
+            synchronized(link) {
+                // `established` is monotonic; a snapshot under the lock paired
+                // with the same lock in the establish path closes the race.
+                shouldTearDown = !link.established
+            }
+            if (shouldTearDown) {
+                Log.w(TAG, "NDP watchdog firing peer=${shortId(link.peerID)} role=${if (link.isServer) "SERVER" else "CLIENT"} after ${NDP_ESTABLISH_TIMEOUT_MS}ms")
+                // Serialize teardown with framework callbacks on the Aware HandlerThread.
+                handler.post { tearDownLink(link) }
+            }
         }
     }
 
@@ -416,11 +557,21 @@ class WifiAwareTransport(
 
     private fun tearDownLink(link: PeerLink) {
         if (peers.remove(link.peerID) == null) return
+        val delta = if (link.establishStartMs > 0) System.currentTimeMillis() - link.establishStartMs else 0L
+        Log.i(TAG, "tearDownLink peer=${shortId(link.peerID)} role=${if (link.isServer) "SERVER" else "CLIENT"} established=${link.established} +${delta}ms")
+        link.watchdog?.cancel()
+        link.watchdog = null
         link.readJob?.cancel()
         try { link.socket?.close() } catch (_: Exception) {}
         try { link.serverSocket?.close() } catch (_: Exception) {}
         link.networkCallback?.let {
             try { connectivityMgr.unregisterNetworkCallback(it) } catch (_: Exception) {}
+        }
+        // Drop any wake-up message ids still waiting on success/fail callbacks
+        // for this peer -- their callbacks would otherwise log a stale peer.
+        val iter = pendingMessageIds.entries.iterator()
+        while (iter.hasNext()) {
+            if (iter.next().value == link.peerID) iter.remove()
         }
         listener?.onTransportPeerDisconnected(this, link.peerID)
     }
@@ -435,6 +586,12 @@ class WifiAwareTransport(
         // setPort/setTransportProtocol are used. Same string on every router
         // in the deployment.
         private const val DATA_PATH_PSK = "blemesh-router-aware-v1"
+        // Per-link NDP establish timeout. The framework typically gives up at
+        // ~51s; we cut over at 18s so we can retry on the next discovery cycle
+        // instead of stalling. Comfortably above typical NDP setup (~1-8s).
+        private const val NDP_ESTABLISH_TIMEOUT_MS = 18_000L
+        private const val MSG_SEND_RETRIES = 2
+        private const val MSG_SEND_RETRY_DELAY_MS = 500L
 
         fun isAvailable(context: Context): Boolean {
             val pm = context.packageManager
