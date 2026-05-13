@@ -48,6 +48,37 @@ class BleMeshService(
         private const val SCAN_RESTART_INTERVAL_MS = 30_000L
         private const val RSSI_POLL_INTERVAL_MS = 15_000L
 
+        // Store-and-forward bounds.
+        // Per-peer ring depth: enough for a noise handshake (3-4 frames) plus a
+        // few queued messages while the peer is suspended.
+        private const val SNF_MAX_PER_PEER = 32
+        // Drop after 60s — beyond that the originator's app-level timeout has
+        // almost certainly fired and replay would be misleading.
+        private const val SNF_MAX_AGE_MS = 60_000L
+        // Sweep idle buffers (peer never reconnects) on this cadence.
+        private const val SNF_SWEEP_INTERVAL_MS = 15_000L
+
+        /**
+         * Packet types worth holding for replay. ANNOUNCE / FRAGMENT / sync
+         * traffic is excluded — those are either heartbeats (regenerated on
+         * the next interval) or already carry their own re-assembly state.
+         */
+        private val SNF_ELIGIBLE_TYPES: Set<Int> = setOf(
+            MessageType.MESSAGE.value.toInt() and 0xFF,
+            MessageType.DELIVERY_ACK.value.toInt() and 0xFF,
+            MessageType.DELIVERY_STATUS_REQUEST.value.toInt() and 0xFF,
+            MessageType.READ_RECEIPT.value.toInt() and 0xFF,
+            MessageType.NOISE_HANDSHAKE.value.toInt() and 0xFF,
+            MessageType.NOISE_ENCRYPTED.value.toInt() and 0xFF,
+            MessageType.NOISE_IDENTITY_ANNOUNCE.value.toInt() and 0xFF,
+            MessageType.LOXATION_ANNOUNCE.value.toInt() and 0xFF,
+            MessageType.LOXATION_QUERY.value.toInt() and 0xFF,
+            MessageType.LOXATION_CHUNK.value.toInt() and 0xFF,
+            MessageType.LOXATION_COMPLETE.value.toInt() and 0xFF,
+            MessageType.LOCATION_UPDATE.value.toInt() and 0xFF,
+            MessageType.MLS_MESSAGE.value.toInt() and 0xFF,
+        )
+
         // Approximate BlemeshPacket header overhead (version+type+ttl+flags+ts+payloadLen+sender+recipient)
         private const val BLEMESH_PACKET_OVERHEAD = 30
         // FRAGMENT packet payload header: [id:8][index:2][total:2][type:1]
@@ -90,6 +121,21 @@ class BleMeshService(
     private val addressToRssi = ConcurrentHashMap<String, Int>()
     private var rssiPollJob: Job? = null
 
+    // Peers that have, at some point during this session, sent a direct
+    // ANNOUNCE to this router (i.e., have a strong-enough BLE link to reach us
+    // at MAX_TTL). Membership is the gate for store-and-forward eligibility:
+    // we don't buffer packets for peers we've never directly served, since
+    // those flow only over the bridge.
+    private val knownLocalPeers: MutableSet<PeerID> = ConcurrentHashMap.newKeySet()
+
+    // Store-and-forward buffer: PeerID -> FIFO of (packet, enqueue-ts).
+    // Holds directed packets for a known local peer while it is briefly
+    // unreachable (iOS background suspend / RPA reconnect). Replayed on the
+    // next direct ANNOUNCE from that peer.
+    private data class PendingPacket(val packet: BlemeshPacket, val enqueuedAtMs: Long)
+    private val pendingByPeer = ConcurrentHashMap<PeerID, ArrayDeque<PendingPacket>>()
+    private var snfSweepJob: Job? = null
+
     private val deduplicator = MessageDeduplicator()
     private val fragmentationManager = BleMeshFragmentationManager()
     private val reassemblyBuffer = BleMeshFragmentationManager.ReassemblyBuffer()
@@ -126,6 +172,7 @@ class BleMeshService(
         startGattServer()
         startScanning()
         startRssiPolling()
+        startSnfSweep()
     }
 
     fun stop() {
@@ -136,9 +183,12 @@ class BleMeshService(
         gossipSyncManager.stop()
         stopScanning()
         stopRssiPolling()
+        stopSnfSweep()
         stopAdvertising()
         stopGattServer()
         disconnectAll()
+        pendingByPeer.clear()
+        knownLocalPeers.clear()
     }
 
     private fun startRssiPolling() {
@@ -157,6 +207,89 @@ class BleMeshService(
     private fun stopRssiPolling() {
         rssiPollJob?.cancel()
         rssiPollJob = null
+    }
+
+    // --- Store-and-forward ---
+
+    /**
+     * Buffer a directed packet for a known-local peer that is currently
+     * unreachable. No-op for broadcasts, ineligible types, or peers we've
+     * never directly served. The oldest entries in the per-peer ring are
+     * evicted when the cap is hit.
+     */
+    private fun maybeBufferForLater(packet: BlemeshPacket) {
+        if (packet.isBroadcast) return
+        val typeInt = packet.type.toInt() and 0xFF
+        if (typeInt !in SNF_ELIGIBLE_TYPES) return
+        val recipient = packet.recipientPeerID() ?: return
+        if (recipient !in knownLocalPeers) return
+        if (peerIdToAddress.containsKey(recipient)) return // currently reachable; broadcast will deliver
+
+        val now = System.currentTimeMillis()
+        val queue = pendingByPeer.computeIfAbsent(recipient) { ArrayDeque() }
+        val size: Int
+        synchronized(queue) {
+            // Drop aged-out entries while we're touching it.
+            while (queue.isNotEmpty() && now - queue.first().enqueuedAtMs > SNF_MAX_AGE_MS) {
+                queue.removeFirst()
+            }
+            if (queue.size >= SNF_MAX_PER_PEER) queue.removeFirst()
+            queue.addLast(PendingPacket(packet, now))
+            size = queue.size
+        }
+        Log.d(TAG, "S&F buffer type=0x${"%02x".format(packet.type.toInt() and 0xFF)} for ${recipient.rawValue.take(8)} (q=$size)")
+    }
+
+    /**
+     * Called when a peer freshly announces. Replays any buffered packets to
+     * the now-live BLE address. Drops aged entries. No-op if nothing pending.
+     */
+    private fun flushPendingFor(peerID: PeerID) {
+        val queue = pendingByPeer.remove(peerID) ?: return
+        val snapshot: List<PendingPacket>
+        synchronized(queue) {
+            snapshot = queue.toList()
+            queue.clear()
+        }
+        val now = System.currentTimeMillis()
+        var sent = 0
+        var dropped = 0
+        for (entry in snapshot) {
+            if (now - entry.enqueuedAtMs > SNF_MAX_AGE_MS) {
+                dropped++
+                continue
+            }
+            sendPacketToPeer(peerID, entry.packet)
+            sent++
+        }
+        if (sent > 0 || dropped > 0) {
+            Log.i(TAG, "S&F replay ${peerID.rawValue.take(8)}: sent=$sent dropped=$dropped")
+        }
+    }
+
+    private fun startSnfSweep() {
+        snfSweepJob?.cancel()
+        snfSweepJob = scope.launch {
+            while (isActive && isRunning) {
+                delay(SNF_SWEEP_INTERVAL_MS)
+                val now = System.currentTimeMillis()
+                val emptyKeys = mutableListOf<PeerID>()
+                for ((peerID, queue) in pendingByPeer) {
+                    synchronized(queue) {
+                        while (queue.isNotEmpty() && now - queue.first().enqueuedAtMs > SNF_MAX_AGE_MS) {
+                            queue.removeFirst()
+                        }
+                        if (queue.isEmpty()) emptyKeys += peerID
+                    }
+                }
+                for (k in emptyKeys) pendingByPeer.remove(k)
+            }
+        }
+    }
+
+    private fun stopSnfSweep() {
+        snfSweepJob?.cancel()
+        snfSweepJob = null
     }
 
     // --- Public API ---
@@ -215,7 +348,16 @@ class BleMeshService(
         // via BLE collide on a single key (sender-ts-type-fragmentID-index).
         if (deduplicator.isDuplicate(buildDeduplicationKey(packet))) return
 
-        Log.d(TAG, "Injecting WiFi packet type=0x${"%02x".format(packet.type)} into BLE mesh")
+        val type = "0x%02x".format(packet.type.toInt() and 0xFF)
+        val targets = connectedPeers.keys.joinToString(",")
+        Log.d(TAG, "WiFi→BLE inject type=$type → [${if (targets.isEmpty()) "no BLE peers" else targets}]")
+
+        // Store-and-forward: if the directed recipient is a known local peer
+        // that is currently disconnected, buffer for replay on reconnect. The
+        // broadcast below still happens (mesh redundancy); the buffer is a
+        // belt-and-suspenders backup for the case where no live BLE address
+        // exists for the recipient at this moment.
+        maybeBufferForLater(packet)
 
         // Track in gossip
         gossipSyncManager.onPublicPacketSeen(packet)
@@ -509,9 +651,12 @@ class BleMeshService(
 
         // Relay if appropriate
         if (BlemeshProtocol.shouldRelay(packet)) {
+            // Also buffer the relayed copy for the directed recipient if they
+            // are a known-local peer that is currently disconnected.
+            val relayed = packet.withDecrementedTTL()
+            maybeBufferForLater(relayed)
             scope.launch {
                 delay(BlemeshProtocol.getRelayJitterMs().toLong())
-                val relayed = packet.withDecrementedTTL()
                 broadcastPacketExcluding(relayed, fromAddress)
             }
         }
@@ -559,13 +704,28 @@ class BleMeshService(
         // different addresses on Android's stack. Without eviction, the same
         // PeerID accumulates under multiple address keys and getConnectedPeerIDs()
         // reports the peer N times.
+        //
+        // Critically: also tear down the stale GATT/server connection. Without
+        // this, broadcastPacket() iterates connectedPeers and writes to the dead
+        // physical link as well as the live one. Those writes succeed at the
+        // Android API layer (WRITE_NO_RESPONSE returns immediately) but are
+        // silently dropped on-air — the recipient never sees the packet. Most
+        // visibly impacts NOISE_HANDSHAKE retries and short encrypted messages
+        // sent during the brief window after an address rotation.
         val priorAddress = peerIdToAddress[peerID]
         if (priorAddress != null && priorAddress != fromAddress) {
             addressToPeerID.remove(priorAddress)
+            evictStaleConnection(priorAddress, peerID)
         }
 
         val isNewMapping = addressToPeerID.put(fromAddress, peerID) != peerID
         peerIdToAddress[peerID] = fromAddress
+        knownLocalPeers.add(peerID)
+
+        // Replay any packets we held for this peer while it was off-air. Even
+        // if isNewMapping is false (same address re-ANNOUNCEs us), a buffer
+        // can still exist from a transient disconnect → reconnect cycle.
+        flushPendingFor(peerID)
 
         if (isNewMapping) {
             packetListener?.onPeerDiscovered(peerID, fromAddress)
@@ -687,6 +847,30 @@ class BleMeshService(
             peerIdToAddress.remove(peerID)
             packetListener?.onPeerDisconnected(peerID, address)
             gossipSyncManager.removeAnnouncementForPeer(peerID)
+        }
+    }
+
+    /**
+     * Forcibly close the GATT/server connection for a stale BLE address.
+     * Called when a peer reannounces from a new address: the old physical
+     * link must stop receiving writes immediately so we don't fan out into
+     * a dead radio path.
+     */
+    private fun evictStaleConnection(address: String, peerID: PeerID) {
+        val conn = connectedPeers.remove(address) ?: return
+        addressToRssi.remove(address)
+        Log.i(TAG, "Evicting stale BLE connection $address for peer ${peerID.rawValue.take(8)}")
+        val gatt = conn.gatt
+        if (gatt != null) {
+            try { gatt.disconnect() } catch (_: SecurityException) {} catch (_: Exception) {}
+            try { gatt.close() } catch (_: Exception) {}
+        } else {
+            // Server-side connection: cancel from the server's side so Android
+            // tears down the link instead of waiting for the supervision timeout.
+            try {
+                val device = bluetoothAdapter?.getRemoteDevice(address)
+                if (device != null) gattServer?.cancelConnection(device)
+            } catch (_: SecurityException) {} catch (_: Exception) {}
         }
     }
 

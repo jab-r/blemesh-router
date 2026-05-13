@@ -46,6 +46,9 @@ class MeshRouterService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val RTT_PING_INTERVAL_MS = 5_000L
         private const val RTT_PING_PAYLOAD_BYTES = 8
+        // Sliding window for the retry-storm counter. A (sender,recipient,type)
+        // bucket resets if no new origination is seen for this long.
+        private const val RETRY_WINDOW_MS = 30_000L
 
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
@@ -104,6 +107,15 @@ class MeshRouterService : Service() {
     // (transport name, peerID) -> last measured RTT in ms.
     private val rttByTransportPeer = ConcurrentHashMap<Pair<String, PeerID>, Long>()
     private var rttJob: Job? = null
+
+    // Counts distinct originations of (sender, recipient, type) within a sliding
+    // window. Each NOISE_HANDSHAKE retransmission carries a fresh timestamp so it
+    // bypasses dedup, but it lands on the same (sender, recipient, type) bucket.
+    // A high count here means the handshake isn't completing — the originator's
+    // Noise stack keeps re-driving the same state because it never sees the next
+    // message back from the peer.
+    private data class RetryCounter(var count: Int, var firstSeenMs: Long, var lastSeenMs: Long)
+    private val packetRetryCounts = ConcurrentHashMap<String, RetryCounter>()
 
     override fun onCreate() {
         super.onCreate()
@@ -249,7 +261,10 @@ class MeshRouterService : Service() {
         val dedupKey = "ble2br-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
+        val tag = packetTag(packet)
+        trackRetry("ble→br", packet)
         if (packet.isBroadcast) {
+            Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
             for (t in transports) t.broadcast(packet)
             bleToBridgeCount++
             return
@@ -257,6 +272,7 @@ class MeshRouterService : Service() {
 
         val recipient = packet.recipientPeerID()
         if (recipient != null && bleMeshService.isLocalPeer(recipient)) {
+            Log.d(TAG, "BLE→bridge SKIP (recipient local) $tag")
             return  // already deliverable locally
         }
 
@@ -265,10 +281,58 @@ class MeshRouterService : Service() {
         val targeted = recipient?.let { r ->
             transports.firstOrNull { r in it.connectedPeerIDs() }?.also { it.sendToPeer(r, packet) }
         }
-        if (targeted == null) {
+        if (targeted != null) {
+            Log.d(TAG, "BLE→bridge DIRECT $tag via ${targeted.name}")
+        } else {
+            Log.d(TAG, "BLE→bridge FANOUT $tag via ${transports.joinToString(",") { it.name }}")
             for (t in transports) t.broadcast(packet)
         }
         bleToBridgeCount++
+    }
+
+    private fun packetTag(packet: BlemeshPacket): String {
+        val type = "0x%02x".format(packet.type.toInt() and 0xFF)
+        val sender = PeerID.fromLongBE(packet.senderId)?.rawValue?.take(8) ?: "?"
+        val recipient = if (packet.isBroadcast) "bcast"
+            else packet.recipientPeerID()?.rawValue?.take(8) ?: "?"
+        val ttl = packet.ttl.toInt() and 0xFF
+        return "type=$type ttl=$ttl ${sender}→${recipient}"
+    }
+
+    /**
+     * Count distinct originations per (sender, recipient, type) bucket. Only
+     * counts MAX_TTL packets — i.e. freshly originated, not relayed copies —
+     * since those are the ones that reflect "the originator's stack hasn't
+     * given up yet". Logs a warning at count thresholds so handshake-retry
+     * storms surface in router.log.
+     */
+    private fun trackRetry(direction: String, packet: BlemeshPacket) {
+        if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
+        // Only count types where repeated originations are diagnostic. ANNOUNCE
+        // is a periodic heartbeat (very chatty); FRAGMENT carries its own
+        // de-duplication via the fragment ID. Storms on NOISE_HANDSHAKE /
+        // NOISE_ENCRYPTED / MESSAGE / DELIVERY_ACK are the real signal.
+        val typeInt = packet.type.toInt() and 0xFF
+        if (typeInt == (MessageType.ANNOUNCE.value.toInt() and 0xFF)) return
+        if (typeInt == (MessageType.FRAGMENT.value.toInt() and 0xFF)) return
+        val sender = PeerID.fromLongBE(packet.senderId)?.rawValue?.take(8) ?: "?"
+        val recipient = if (packet.isBroadcast) "bcast"
+            else packet.recipientPeerID()?.rawValue?.take(8) ?: "?"
+        val type = "0x%02x".format(packet.type.toInt() and 0xFF)
+        val key = "$sender→$recipient:$type"
+        val now = System.currentTimeMillis()
+        val rc = packetRetryCounts.compute(key) { _, existing ->
+            if (existing == null || now - existing.lastSeenMs > RETRY_WINDOW_MS) {
+                RetryCounter(1, now, now)
+            } else {
+                existing.count++
+                existing.lastSeenMs = now
+                existing
+            }
+        }!!
+        if (rc.count == 3 || rc.count == 6 || (rc.count > 6 && rc.count % 5 == 0)) {
+            Log.w(TAG, "RETRY-STORM $direction $key x${rc.count} over ${now - rc.firstSeenMs}ms")
+        }
     }
 
     // --- Bridge → BLE Mesh ---
@@ -311,16 +375,24 @@ class MeshRouterService : Service() {
         val dedupKey = "br2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
+        val tag = packetTag(packet)
+        trackRetry("br→ble", packet)
+        Log.d(TAG, "bridge→BLE ${fromTransport.name}<-${fromRouter.rawValue.take(8)} $tag")
         bleMeshService.injectPacketFromWifi(packet)
         bridgeToBleCount++
 
         // Multi-hop: forward to other router peers (across all transports)
         // excluding the one we just heard it from.
+        val fwdTargets = mutableListOf<String>()
         for (t in transports) {
             for (peerID in t.connectedPeerIDs()) {
                 if (t === fromTransport && peerID == fromRouter) continue
                 t.sendToPeer(peerID, packet)
+                fwdTargets += "${t.name}:${peerID.rawValue.take(8)}"
             }
+        }
+        if (fwdTargets.isNotEmpty()) {
+            Log.d(TAG, "bridge→bridge multi-hop $tag → ${fwdTargets.joinToString(",")}")
         }
     }
 
