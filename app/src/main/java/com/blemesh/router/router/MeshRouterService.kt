@@ -17,6 +17,9 @@ import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
 import com.blemesh.router.util.MessageDeduplicator
 import kotlinx.coroutines.*
+import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Main BLE Mesh Router service.
@@ -41,6 +44,8 @@ class MeshRouterService : Service() {
         private const val TAG = "MeshRouterService"
         private const val NOTIFICATION_CHANNEL_ID = "blemesh_router"
         private const val NOTIFICATION_ID = 1
+        private const val RTT_PING_INTERVAL_MS = 5_000L
+        private const val RTT_PING_PAYLOAD_BYTES = 8
 
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
@@ -92,6 +97,13 @@ class MeshRouterService : Service() {
         private set
     @Volatile var bridgeToBleCount = 0L
         private set
+
+    // RTT tracking: nonce -> send time (ns). One global map; nonces are unique.
+    private val outstandingPings = ConcurrentHashMap<Long, Long>()
+    private val pingNonceSeq = AtomicLong(System.nanoTime())
+    // (transport name, peerID) -> last measured RTT in ms.
+    private val rttByTransportPeer = ConcurrentHashMap<Pair<String, PeerID>, Long>()
+    private var rttJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -150,12 +162,18 @@ class MeshRouterService : Service() {
             }
         }
 
+        startRttProbing()
+
         Log.i(TAG, "Router started with ${transports.size} transport(s)")
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        rttJob?.cancel()
+        rttJob = null
+        outstandingPings.clear()
+        rttByTransportPeer.clear()
         lanDiscovery.stop()
         bleMeshService.stop()
         for (t in transports) t.stop()
@@ -171,7 +189,7 @@ class MeshRouterService : Service() {
     data class Snapshot(
         val peerID: PeerID,
         val configuredSsid: String,
-        val blePeers: List<PeerID>,
+        val blePeers: List<BlePeerInfo>,
         val transports: List<TransportSnapshot>,
         val bleToBridge: Long,
         val bridgeToBle: Long
@@ -180,18 +198,25 @@ class MeshRouterService : Service() {
     data class TransportSnapshot(
         val name: String,
         val available: Boolean,
-        val peers: List<PeerID>
+        val peers: List<RouterPeerInfo>
     )
+
+    data class BlePeerInfo(val peerID: PeerID, val rssi: Int?)
+    data class RouterPeerInfo(val peerID: PeerID, val rttMs: Long?)
 
     fun snapshot(): Snapshot = Snapshot(
         peerID = myPeerID,
         configuredSsid = WifiCredentials.load(this).ssid,
-        blePeers = bleMeshService.getConnectedPeerIDs(),
-        transports = transports.map {
+        blePeers = bleMeshService.getConnectedPeerIDs().map {
+            BlePeerInfo(it, bleMeshService.getPeerRssi(it))
+        },
+        transports = transports.map { t ->
             TransportSnapshot(
-                name = it.name,
-                available = it.isAvailable(),
-                peers = it.connectedPeerIDs()
+                name = t.name,
+                available = t.isAvailable(),
+                peers = t.connectedPeerIDs().map { p ->
+                    RouterPeerInfo(p, rttByTransportPeer[t.name to p])
+                }
             )
         },
         bleToBridge = bleToBridgeCount,
@@ -271,6 +296,18 @@ class MeshRouterService : Service() {
         packet: BlemeshPacket,
         fromRouter: PeerID
     ) {
+        // Router-internal control traffic: never inject into BLE, never multi-hop.
+        when (packet.type) {
+            MessageType.ROUTER_PING.value -> {
+                handleRouterPing(fromTransport, packet, fromRouter)
+                return
+            }
+            MessageType.ROUTER_PONG.value -> {
+                handleRouterPong(fromTransport, packet, fromRouter)
+                return
+            }
+        }
+
         val dedupKey = "br2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
@@ -285,6 +322,76 @@ class MeshRouterService : Service() {
                 t.sendToPeer(peerID, packet)
             }
         }
+    }
+
+    // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---
+
+    private fun startRttProbing() {
+        rttJob?.cancel()
+        rttJob = serviceScope.launch {
+            while (isActive) {
+                delay(RTT_PING_INTERVAL_MS)
+                for (t in transports) {
+                    for (peerID in t.connectedPeerIDs()) {
+                        sendRouterPing(t, peerID)
+                    }
+                }
+                // Garbage-collect pings older than 10x the interval so the map
+                // doesn't grow when peers vanish without replying.
+                val cutoffNs = System.nanoTime() - RTT_PING_INTERVAL_MS * 1_000_000L * 10
+                outstandingPings.entries.removeAll { it.value < cutoffNs }
+            }
+        }
+    }
+
+    private fun sendRouterPing(transport: RouterTransport, peer: PeerID) {
+        val nonce = pingNonceSeq.incrementAndGet()
+        val payload = ByteBuffer.allocate(RTT_PING_PAYLOAD_BYTES).putLong(nonce).array()
+        val packet = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ROUTER_PING.value,
+            ttl = 1.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
+            senderId = myPeerID.toLongBE(),
+            recipientId = peer.toLongBE(),
+            payload = payload,
+            signature = null
+        )
+        outstandingPings[nonce] = System.nanoTime()
+        transport.sendToPeer(peer, packet)
+    }
+
+    private fun handleRouterPing(
+        fromTransport: RouterTransport,
+        packet: BlemeshPacket,
+        fromRouter: PeerID
+    ) {
+        // Echo the payload back as a PONG over the same transport.
+        val reply = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ROUTER_PONG.value,
+            ttl = 1.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
+            senderId = myPeerID.toLongBE(),
+            recipientId = fromRouter.toLongBE(),
+            payload = packet.payload,
+            signature = null
+        )
+        fromTransport.sendToPeer(fromRouter, reply)
+    }
+
+    private fun handleRouterPong(
+        fromTransport: RouterTransport,
+        packet: BlemeshPacket,
+        fromRouter: PeerID
+    ) {
+        if (packet.payload.size < RTT_PING_PAYLOAD_BYTES) return
+        val nonce = ByteBuffer.wrap(packet.payload, 0, RTT_PING_PAYLOAD_BYTES).long
+        val sentNs = outstandingPings.remove(nonce) ?: return
+        val rttMs = (System.nanoTime() - sentNs) / 1_000_000L
+        rttByTransportPeer[fromTransport.name to fromRouter] = rttMs
     }
 
     // --- Notification ---

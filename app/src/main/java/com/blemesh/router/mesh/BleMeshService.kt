@@ -46,6 +46,7 @@ class BleMeshService(
 
         private const val DEFAULT_MTU = 512
         private const val SCAN_RESTART_INTERVAL_MS = 30_000L
+        private const val RSSI_POLL_INTERVAL_MS = 15_000L
 
         // Approximate BlemeshPacket header overhead (version+type+ttl+flags+ts+payloadLen+sender+recipient)
         private const val BLEMESH_PACKET_OVERHEAD = 30
@@ -83,6 +84,11 @@ class BleMeshService(
     // BLE address -> PeerID mapping (populated from ANNOUNCE packets)
     private val addressToPeerID = ConcurrentHashMap<String, PeerID>()
     private val peerIdToAddress = ConcurrentHashMap<PeerID, String>()
+    // BLE address -> last observed RSSI (dBm). Updated from scan results and
+    // from periodic readRemoteRssi() on client-side GATT connections. Stays
+    // populated after the scanner stops surfacing the address.
+    private val addressToRssi = ConcurrentHashMap<String, Int>()
+    private var rssiPollJob: Job? = null
 
     private val deduplicator = MessageDeduplicator()
     private val fragmentationManager = BleMeshFragmentationManager()
@@ -119,6 +125,7 @@ class BleMeshService(
         startAdvertising()
         startGattServer()
         startScanning()
+        startRssiPolling()
     }
 
     fun stop() {
@@ -128,9 +135,28 @@ class BleMeshService(
 
         gossipSyncManager.stop()
         stopScanning()
+        stopRssiPolling()
         stopAdvertising()
         stopGattServer()
         disconnectAll()
+    }
+
+    private fun startRssiPolling() {
+        rssiPollJob?.cancel()
+        rssiPollJob = scope.launch {
+            while (isActive && isRunning) {
+                delay(RSSI_POLL_INTERVAL_MS)
+                for ((_, connection) in connectedPeers) {
+                    val gatt = connection.gatt ?: continue
+                    try { gatt.readRemoteRssi() } catch (_: SecurityException) { } catch (_: Exception) { }
+                }
+            }
+        }
+    }
+
+    private fun stopRssiPolling() {
+        rssiPollJob?.cancel()
+        rssiPollJob = null
     }
 
     // --- Public API ---
@@ -148,6 +174,12 @@ class BleMeshService(
     /** Check if a PeerID is reachable via local BLE mesh. */
     fun isLocalPeer(peerID: PeerID): Boolean {
         return peerIdToAddress.containsKey(peerID)
+    }
+
+    /** Last observed RSSI for a connected BLE peer, or null if unknown. */
+    fun getPeerRssi(peerID: PeerID): Int? {
+        val address = peerIdToAddress[peerID] ?: return null
+        return addressToRssi[address]
     }
 
     /** Send a packet to all connected BLE peers (broadcast). */
@@ -238,9 +270,10 @@ class BleMeshService(
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val address = device.address
+            addressToRssi[address] = result.rssi
             if (connectedPeers.containsKey(address)) return
 
-            Log.d(TAG, "Discovered BLE mesh device: $address")
+            Log.d(TAG, "Discovered BLE mesh device: $address (rssi=${result.rssi})")
             connectToDevice(device)
         }
     }
@@ -419,6 +452,12 @@ class BleMeshService(
         ) {
             if (characteristic.uuid == CHARACTERISTIC_UUID) {
                 handleIncomingData(value, gatt.device.address)
+            }
+        }
+
+        override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                addressToRssi[gatt.device.address] = rssi
             }
         }
 
@@ -642,6 +681,7 @@ class BleMeshService(
 
     private fun handleDisconnection(address: String) {
         connectedPeers.remove(address)
+        addressToRssi.remove(address)
         val peerID = addressToPeerID.remove(address)
         if (peerID != null) {
             peerIdToAddress.remove(peerID)
@@ -658,6 +698,7 @@ class BleMeshService(
         connectedPeers.clear()
         addressToPeerID.clear()
         peerIdToAddress.clear()
+        addressToRssi.clear()
     }
 
     private fun derivePeerID(noisePublicKey: ByteArray): PeerID {

@@ -173,12 +173,18 @@ class MainActivity : ComponentActivity() {
         blePeersView.text = if (snap.blePeers.isEmpty()) {
             "(none)"
         } else {
-            snap.blePeers.joinToString("\n") { "  " + it.rawValue.take(8) + "..." }
+            snap.blePeers.joinToString("\n") { info ->
+                val rssi = info.rssi?.let { "${it} dBm" } ?: "rssi ?"
+                "  " + info.peerID.rawValue.take(8) + "...  " + rssi
+            }
         }
         transportsView.text = snap.transports.joinToString("\n\n") { t ->
             val avail = if (t.available) "available" else "unavailable"
             val peers = if (t.peers.isEmpty()) "    (no peers)"
-            else t.peers.joinToString("\n") { "    " + it.rawValue.take(8) + "..." }
+            else t.peers.joinToString("\n") { info ->
+                val rtt = info.rttMs?.let { "${it} ms" } ?: "rtt ?"
+                "    " + info.peerID.rawValue.take(8) + "...  " + rtt
+            }
             "  ${t.name}  ($avail)\n$peers"
         }
         statsView.text = buildString {

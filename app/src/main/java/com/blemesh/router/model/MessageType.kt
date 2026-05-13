@@ -32,7 +32,11 @@ enum class MessageType(val value: Byte) {
     MLS_MESSAGE(0x48),
 
     // Gossip sync
-    REQUEST_SYNC(0x60);
+    REQUEST_SYNC(0x60),
+
+    // Router-to-router only (never enters the BLE mesh)
+    ROUTER_PING(0x70),
+    ROUTER_PONG(0x71);
 
     companion object {
         fun from(value: Byte): MessageType? = entries.firstOrNull { it.value == value }
