@@ -25,25 +25,11 @@ object BinaryProtocol {
     const val SIGNATURE_SIZE = 64
     private const val MAX_REASONABLE_ORIGINAL_SIZE = 1_048_576
 
-    /** Types that should never be compressed (high entropy or protocol-critical). */
-    private val NO_COMPRESS_TYPES: Set<Int> = setOf(
-        MessageType.NOISE_HANDSHAKE.value.toInt() and 0xFF,
-        MessageType.NOISE_ENCRYPTED.value.toInt() and 0xFF,
-        MessageType.LOXATION_ANNOUNCE.value.toInt() and 0xFF,
-        MessageType.LOXATION_CHUNK.value.toInt() and 0xFF,
-        MessageType.LOXATION_QUERY.value.toInt() and 0xFF,
-        MessageType.LOXATION_COMPLETE.value.toInt() and 0xFF,
-        MessageType.MLS_MESSAGE.value.toInt() and 0xFF,
-        MessageType.REQUEST_SYNC.value.toInt() and 0xFF,
-        MessageType.LOCATION_UPDATE.value.toInt() and 0xFF,
-    )
-
     fun encode(packet: BlemeshPacket, padding: Boolean = false): ByteArray? {
         return try {
             val hasRecipient = packet.recipientId != BlemeshPacket.BROADCAST_ADDRESS
             val hasSignature = packet.signature?.size == SIGNATURE_SIZE
-            val typeInt = packet.type.toInt() and 0xFF
-            val allowCompression = typeInt !in NO_COMPRESS_TYPES
+            val allowCompression = MessageType.isCompressible(packet.type)
 
             var payload = packet.payload
             var isCompressed = false

@@ -2,6 +2,7 @@ package com.blemesh.router.model
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.security.SecureRandom
 
 /**
@@ -37,6 +38,16 @@ data class PeerID(val rawValue: String) {
         fun fromLongBE(value: Long): PeerID? {
             val bb = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(value).array()
             return fromBytes(bb)
+        }
+
+        /**
+         * The interop-defining derivation: PeerID = first 8 bytes of
+         * SHA-256(noise static public key). Every place that derives an
+         * identity — ours or a remote peer's — must go through here.
+         */
+        fun fromNoisePublicKey(noisePublicKey: ByteArray): PeerID {
+            val digest = MessageDigest.getInstance("SHA-256").digest(noisePublicKey)
+            return fromBytes(digest.copyOfRange(0, 8))!!
         }
     }
 

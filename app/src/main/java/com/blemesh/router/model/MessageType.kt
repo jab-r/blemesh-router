@@ -60,5 +60,74 @@ enum class MessageType(val value: Byte) {
 
     companion object {
         fun from(value: Byte): MessageType? = entries.firstOrNull { it.value == value }
+
+        // ------------------------------------------------------------------
+        // Per-type policy table.
+        //
+        // Every behavior that branches on a message type is decided here, so
+        // porting a new type from the references means answering each
+        // question — compress? bridge? buffer? track? — in one place instead
+        // of hunting through three files. (A stale include-list in the router
+        // once silently broke cross-segment PROTOCOL_ACK, and a missed
+        // compression exclusion corrupted payloads on iOS.)
+        //
+        // Predicates take the raw wire byte, not the enum: policy must also
+        // cover type codes this build doesn't know by name, and each
+        // predicate documents its default for unknown codes.
+        // ------------------------------------------------------------------
+
+        private fun bytes(vararg types: MessageType): Set<Byte> =
+            types.mapTo(HashSet()) { it.value }
+
+        /**
+         * Payloads that are encrypted, already-compressed, or entropy-dense
+         * binary — compression wastes cycles on them and a cross-platform
+         * decode mismatch here has corrupted payloads on iOS before.
+         * Unknown codes: compressible (the payload-size heuristic still gates).
+         */
+        private val NO_COMPRESS = bytes(
+            NOISE_HANDSHAKE, NOISE_ENCRYPTED,
+            LOXATION_ANNOUNCE, LOXATION_CHUNK, LOXATION_QUERY, LOXATION_COMPLETE,
+            MLS_MESSAGE, REQUEST_SYNC, LOCATION_UPDATE,
+        )
+        fun isCompressible(type: Byte): Boolean = type !in NO_COMPRESS
+
+        /**
+         * Types that must NOT cross a Wi-Fi bridge in either direction:
+         * ROUTER_PING/PONG are router-internal control traffic; UWB_RANGING
+         * is meaningful only within BLE radio range.
+         * Unknown codes: bridgeable — an include-list here silently dropped
+         * PROTOCOL_ACK / HANDSHAKE_REQUEST / version negotiation / WebRTC
+         * signaling between reference peers.
+         */
+        private val NON_BRIDGEABLE = bytes(UWB_RANGING, ROUTER_PING, ROUTER_PONG)
+        fun isBridgeable(type: Byte): Boolean = type !in NON_BRIDGEABLE
+
+        /**
+         * Worth holding for store-and-forward replay while a known local peer
+         * is briefly off-air. ANNOUNCE / FRAGMENT / sync traffic is excluded:
+         * heartbeats regenerate on the next interval and fragments carry
+         * their own re-assembly state.
+         * Unknown codes: NOT eligible — only buffer types whose replay
+         * semantics we understand.
+         */
+        private val SNF_ELIGIBLE = bytes(
+            MESSAGE, DELIVERY_ACK, DELIVERY_STATUS_REQUEST, READ_RECEIPT,
+            NOISE_HANDSHAKE, NOISE_ENCRYPTED, NOISE_IDENTITY_ANNOUNCE,
+            LOXATION_ANNOUNCE, LOXATION_QUERY, LOXATION_CHUNK, LOXATION_COMPLETE,
+            LOCATION_UPDATE, MLS_MESSAGE,
+        )
+        fun isStoreAndForwardEligible(type: Byte): Boolean = type in SNF_ELIGIBLE
+
+        /**
+         * Counted by the retry-storm diagnostic. ANNOUNCE is a periodic
+         * heartbeat (very chatty); FRAGMENT de-duplicates via its fragment
+         * ID. Storms on NOISE_HANDSHAKE / NOISE_ENCRYPTED / MESSAGE /
+         * DELIVERY_ACK are the real signal.
+         * Unknown codes: tracked — an unknown chatty type is exactly what
+         * the diagnostic should surface.
+         */
+        private val RETRY_TRACKING_EXEMPT = bytes(ANNOUNCE, FRAGMENT)
+        fun isRetryTracked(type: Byte): Boolean = type !in RETRY_TRACKING_EXEMPT
     }
 }

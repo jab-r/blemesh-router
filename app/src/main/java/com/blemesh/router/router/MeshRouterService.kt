@@ -57,20 +57,6 @@ class MeshRouterService : Service() {
         var INSTANCE: MeshRouterService? = null
             private set
 
-        /**
-         * Packet types that must NOT cross a Wi-Fi bridge. Everything else is
-         * bridged, including type codes this build doesn't know by name —
-         * an include-list silently broke cross-segment PROTOCOL_ACK /
-         * HANDSHAKE_REQUEST / version negotiation between reference peers.
-         *
-         * ROUTER_PING/PONG are router-internal control traffic; UWB_RANGING
-         * is meaningful only within BLE radio range.
-         */
-        private val NON_ROUTABLE_TYPES: Set<Int> = setOf(
-            MessageType.UWB_RANGING.value.toInt() and 0xFF,
-            MessageType.ROUTER_PING.value.toInt() and 0xFF,
-            MessageType.ROUTER_PONG.value.toInt() and 0xFF,
-        )
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -84,7 +70,7 @@ class MeshRouterService : Service() {
     // references' 5-minute dedup so a late replay can't loop between routers.
     private val bridgeDeduplicator = MessageDeduplicator(
         maxAgeMillis = 5 * 60_000L,
-        maxEntries = 2000
+        maxEntries = 5000
     )
 
     @Volatile var bleToBridgeCount = 0L
@@ -244,8 +230,7 @@ class MeshRouterService : Service() {
     }
 
     private fun routeBlePacketToBridge(packet: BlemeshPacket) {
-        val typeInt = packet.type.toInt() and 0xFF
-        if (typeInt in NON_ROUTABLE_TYPES) return
+        if (!MessageType.isBridgeable(packet.type)) return
 
         val dedupKey = "ble2br-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
@@ -277,12 +262,19 @@ class MeshRouterService : Service() {
             return
         }
 
-        // Crossing the bridge is a hop: require a relayable TTL and spend one
-        // unit, exactly like a BLE relay. This also keeps local-only (ttl=0)
-        // gossip replays from leaking into remote segments, and ensures the
-        // packet never arrives at a remote phone at MAX_TTL (see above).
-        if ((packet.ttl.toInt() and 0xFF) <= 1) return
-        val bridged = packet.withDecrementedTTL()
+        // Crossing the bridge is a hop: spend one TTL unit (floor 0) so the
+        // packet never arrives at a remote phone at MAX_TTL and masquerades
+        // as a direct connection (see above). Low-TTL packets still cross:
+        // gossip replays are emitted at ttl=0 ("local-only" in the
+        // references) but the bridge is the only cross-segment backfill
+        // path — routers don't gossip-sync each other over Wi-Fi. They
+        // arrive at the far segment at ttl=0: delivered to that router's
+        // directly connected phones, never re-relayed. REQUEST_SYNC keeps
+        // the old rule — a ttl=0 sync request describes the local segment
+        // and is answered by the local router.
+        val ttlInt = packet.ttl.toInt() and 0xFF
+        if (packet.type == MessageType.REQUEST_SYNC.value && ttlInt == 0) return
+        val bridged = if (ttlInt > 0) packet.withDecrementedTTL() else packet
 
         if (bridged.isBroadcast) {
             Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
@@ -323,13 +315,7 @@ class MeshRouterService : Service() {
      */
     private fun trackRetry(direction: String, packet: BlemeshPacket) {
         if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
-        // Only count types where repeated originations are diagnostic. ANNOUNCE
-        // is a periodic heartbeat (very chatty); FRAGMENT carries its own
-        // de-duplication via the fragment ID. Storms on NOISE_HANDSHAKE /
-        // NOISE_ENCRYPTED / MESSAGE / DELIVERY_ACK are the real signal.
-        val typeInt = packet.type.toInt() and 0xFF
-        if (typeInt == (MessageType.ANNOUNCE.value.toInt() and 0xFF)) return
-        if (typeInt == (MessageType.FRAGMENT.value.toInt() and 0xFF)) return
+        if (!MessageType.isRetryTracked(packet.type)) return
         val sender = PeerID.fromLongBE(packet.senderId)?.rawValue?.take(8) ?: "?"
         val recipient = if (packet.isBroadcast) "bcast"
             else packet.recipientPeerID()?.rawValue?.take(8) ?: "?"
@@ -387,21 +373,42 @@ class MeshRouterService : Service() {
             }
         }
 
+        // Mirror the BLE→bridge direction: link-local types arriving from an
+        // older or non-compliant peer router must not leak into this segment
+        // or be multi-hopped onward.
+        if (!MessageType.isBridgeable(packet.type)) return
+
         val dedupKey = "br2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
-        val tag = packetTag(packet)
-        trackRetry("br→ble", packet)
+        // Packets addressed to this router terminate here (mirror of the
+        // BLE-side isForMe check): never injected into BLE, never forwarded.
+        if (!packet.isBroadcast && packet.recipientPeerID() == myPeerID) {
+            Log.d(TAG, "bridge→BLE consume ${packetTag(packet)} (addressed to this router)")
+            return
+        }
+
+        // A compliant sender spends a TTL unit for the crossing, so arrival
+        // at MAX_TTL means a pre-fix or non-compliant build. Clamp before
+        // injection, or local reference phones bind the original sender's
+        // PeerID to our BLE address — the masquerade bug the BLE→bridge
+        // direction already guards against.
+        val inbound = if ((packet.ttl.toInt() and 0xFF) >= BlemeshPacket.MAX_TTL) {
+            packet.withTTL((BlemeshPacket.MAX_TTL - 1).toByte())
+        } else packet
+
+        val tag = packetTag(inbound)
+        trackRetry("br→ble", inbound)
         Log.d(TAG, "bridge→BLE ${fromTransport.name}<-${fromRouter.rawValue.take(8)} $tag")
-        bleMeshService.injectPacketFromWifi(packet)
+        bleMeshService.injectPacketFromWifi(inbound)
         bridgeToBleCount++
 
         // Multi-hop: forward to other router peers (across all transports)
         // excluding the one we just heard it from. Each router-to-router hop
         // spends TTL like any other hop, so bridge loops are bounded by TTL
         // as well as by the dedup window.
-        if ((packet.ttl.toInt() and 0xFF) <= 1) return
-        val forwarded = packet.withDecrementedTTL()
+        if ((inbound.ttl.toInt() and 0xFF) <= 1) return
+        val forwarded = inbound.withDecrementedTTL()
         val fwdTargets = mutableListOf<String>()
         for (t in transports) {
             for (peerID in t.connectedPeerIDs()) {

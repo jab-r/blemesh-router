@@ -42,6 +42,7 @@ class BleMeshService(
     private val scope: CoroutineScope
 ) {
     val myPeerID: PeerID = identity.peerID
+    private val myPeerIdLong = identity.peerID.toLongBE()
 
     companion object {
         private const val TAG = "BleMeshService"
@@ -79,33 +80,16 @@ class BleMeshService(
         // Sweep idle buffers (peer never reconnects) on this cadence.
         private const val SNF_SWEEP_INTERVAL_MS = 15_000L
 
-        /**
-         * Packet types worth holding for replay. ANNOUNCE / FRAGMENT / sync
-         * traffic is excluded — those are either heartbeats (regenerated on
-         * the next interval) or already carry their own re-assembly state.
-         */
-        private val SNF_ELIGIBLE_TYPES: Set<Int> = setOf(
-            MessageType.MESSAGE.value.toInt() and 0xFF,
-            MessageType.DELIVERY_ACK.value.toInt() and 0xFF,
-            MessageType.DELIVERY_STATUS_REQUEST.value.toInt() and 0xFF,
-            MessageType.READ_RECEIPT.value.toInt() and 0xFF,
-            MessageType.NOISE_HANDSHAKE.value.toInt() and 0xFF,
-            MessageType.NOISE_ENCRYPTED.value.toInt() and 0xFF,
-            MessageType.NOISE_IDENTITY_ANNOUNCE.value.toInt() and 0xFF,
-            MessageType.LOXATION_ANNOUNCE.value.toInt() and 0xFF,
-            MessageType.LOXATION_QUERY.value.toInt() and 0xFF,
-            MessageType.LOXATION_CHUNK.value.toInt() and 0xFF,
-            MessageType.LOXATION_COMPLETE.value.toInt() and 0xFF,
-            MessageType.LOCATION_UPDATE.value.toInt() and 0xFF,
-            MessageType.MLS_MESSAGE.value.toInt() and 0xFF,
-        )
-
         // Approximate BlemeshPacket header overhead (version+type+ttl+flags+ts+payloadLen+sender+recipient)
         private const val BLEMESH_PACKET_OVERHEAD = 30
         // FRAGMENT packet payload header: [id:8][index:2][total:2][type:1]
         private const val FRAGMENT_HEADER_BYTES = 13
         // Inter-fragment pacing to avoid overflowing peer RX buffers on WRITE_NO_RESPONSE.
         private const val FRAGMENT_PACE_DELAY_MS = 6L
+        // Packets parked per connection while the link is still at the
+        // 23-byte default MTU (a fragment frame's fixed overhead alone
+        // exceeds that budget). Flushed by onMtuChanged.
+        private const val PENDING_MTU_QUEUE_MAX = 16
     }
 
     /**
@@ -174,6 +158,11 @@ class BleMeshService(
     private val fragmentationManager = BleMeshFragmentationManager()
     private val reassemblyBuffer = BleMeshFragmentationManager.ReassemblyBuffer()
 
+    // All server-leg notifies share the single serverCharacteristic object;
+    // the per-connection writeLock can't protect it. value-set + notify must
+    // be atomic across connections or central A receives B's frame.
+    private val serverNotifyLock = Any()
+
     private var scanJob: Job? = null
     private var isRunning = false
 
@@ -192,7 +181,12 @@ class BleMeshService(
         var characteristic: BluetoothGattCharacteristic? = null,
         // Serializes GATT writes per connection. copy() carries the same
         // instance forward, so the lock survives mtu/characteristic updates.
-        val writeLock: Semaphore = Semaphore(1)
+        val writeLock: Semaphore = Semaphore(1),
+        // Packets too large for the pre-negotiation ATT budget, parked until
+        // onMtuChanged flushes them. Same carried-by-copy() semantics as
+        // writeLock.
+        val pendingUntilMtu: MutableList<BlemeshPacket> =
+            java.util.Collections.synchronizedList(mutableListOf())
     )
 
     // --- Lifecycle ---
@@ -259,8 +253,7 @@ class BleMeshService(
      */
     private fun maybeBufferForLater(packet: BlemeshPacket) {
         if (packet.isBroadcast) return
-        val typeInt = packet.type.toInt() and 0xFF
-        if (typeInt !in SNF_ELIGIBLE_TYPES) return
+        if (!MessageType.isStoreAndForwardEligible(packet.type)) return
         val recipient = packet.recipientPeerID() ?: return
         if (recipient !in knownLocalPeers) return
         if (peerIdToAddress.containsKey(recipient)) return // currently reachable; broadcast will deliver
@@ -410,8 +403,10 @@ class BleMeshService(
 
     /** Send a packet to all connected BLE peers (broadcast). */
     fun broadcastPacket(packet: BlemeshPacket) {
+        // Encode once; per-connection work is only MTU sizing.
+        val encoded = BinaryProtocol.encode(packet) ?: return
         for ((_, connection) in connectedPeers) {
-            sendPacketToConnection(connection, packet)
+            sendPacketToConnection(connection, packet, encoded)
         }
     }
 
@@ -444,9 +439,10 @@ class BleMeshService(
         var sent = 0
         // Snapshot to avoid ConcurrentModification mid-iteration.
         val snapshot = synchronized(addrs) { addrs.toList() }
+        val encoded = BinaryProtocol.encode(packet) ?: return 0
         for (addr in snapshot) {
             val conn = connectedPeers[addr] ?: continue
-            sendPacketToConnection(conn, packet)
+            sendPacketToConnection(conn, packet, encoded)
             sent++
         }
         return sent
@@ -633,7 +629,9 @@ class BleMeshService(
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             connectedPeers[device.address]?.let {
-                connectedPeers[device.address] = it.copy(mtu = mtu)
+                val updated = it.copy(mtu = mtu)
+                connectedPeers[device.address] = updated
+                flushPendingForMtu(updated)
             }
         }
 
@@ -742,7 +740,9 @@ class BleMeshService(
             if (status != BluetoothGatt.GATT_SUCCESS) return
             val address = gatt.device.address
             connectedPeers[address]?.let {
-                connectedPeers[address] = it.copy(mtu = mtu)
+                val updated = it.copy(mtu = mtu)
+                connectedPeers[address] = updated
+                flushPendingForMtu(updated)
             }
         }
 
@@ -814,6 +814,18 @@ class BleMeshService(
 
     // --- Packet Handling ---
 
+    /** Re-send packets parked while the connection sat at the default MTU. */
+    private fun flushPendingForMtu(connection: PeerConnection) {
+        val parked: List<BlemeshPacket>
+        synchronized(connection.pendingUntilMtu) {
+            if (connection.pendingUntilMtu.isEmpty()) return
+            parked = connection.pendingUntilMtu.toList()
+            connection.pendingUntilMtu.clear()
+        }
+        Log.d(TAG, "MTU ${connection.mtu} negotiated for ${connection.address}; sending ${parked.size} deferred packet(s)")
+        for (p in parked) sendPacketToConnection(connection, p)
+    }
+
     private fun handleIncomingData(data: ByteArray, fromAddress: String) {
         val packet = BinaryProtocol.decode(data) ?: return
         processIncomingPacket(packet, fromAddress, fromFragment = false)
@@ -829,6 +841,13 @@ class BleMeshService(
      * step — the raw fragments were already relayed hop-by-hop.
      */
     private fun processIncomingPacket(packet: BlemeshPacket, fromAddress: String, fromFragment: Boolean) {
+        // Echoes of our own packets terminate immediately. Outbound sends are
+        // not recorded in the deduplicator, so without this guard a phone
+        // relaying our fragmented ANNOUNCE back would reassemble into a
+        // "fresh" announce that binds myPeerID to the relayer's address and
+        // schedules gossip sync-to-self.
+        if (packet.senderId == myPeerIdLong) return
+
         // Dedup. Inner packets get deduped too: this is what stops a packet we
         // injected from WiFi, re-fragmented, and heard echoed back from being
         // re-broadcast over the bridge a second time.
@@ -839,9 +858,12 @@ class BleMeshService(
 
         // Handle fragments. Malformed FRAGMENTs (payload < 13-byte header) are
         // dropped — never fall through to the generic path (matches references).
+        // A reassembled inner packet may itself be a FRAGMENT (a relayed
+        // FRAGMENT that got re-fragmented for a smaller-MTU leg); it must
+        // re-enter reassembly or the outer transfer can never complete.
         if (messageType == MessageType.FRAGMENT) {
-            if (!fromFragment && packet.payload.size >= 13) {
-                handleFragment(packet, fromAddress)
+            if (packet.payload.size >= 13) {
+                handleFragment(packet, fromAddress, fromFragment)
             }
             return
         }
@@ -887,7 +909,7 @@ class BleMeshService(
         }
     }
 
-    private fun handleFragment(packet: BlemeshPacket, fromAddress: String) {
+    private fun handleFragment(packet: BlemeshPacket, fromAddress: String, fromFragment: Boolean) {
         // Wire format: [id:8][index:2 BE][total:2 BE][originalType:1][data:var] = 13-byte header
         if (packet.payload.size < 13) return
         val fragmentId = packet.payload.copyOfRange(0, 8)
@@ -903,12 +925,23 @@ class BleMeshService(
         if (reassembled != null) {
             val innerPacket = BinaryProtocol.decode(reassembled)
             if (innerPacket != null) {
-                processIncomingPacket(innerPacket, fromAddress, fromFragment = true)
+                // The fragments made the hops, not the inner packet: relayers
+                // decrement the outer FRAGMENT's TTL while the inner bytes
+                // ride untouched. Clamp the inner TTL to the outer's so a
+                // relayed-then-reassembled ANNOUNCE can't pass handleAnnounce's
+                // ttl==MAX_TTL "direct connection" check and bind the original
+                // sender's PeerID to the relayer's address.
+                val outerTtl = packet.ttl.toInt() and 0xFF
+                val inner = if ((innerPacket.ttl.toInt() and 0xFF) > outerTtl) {
+                    innerPacket.withTTL(outerTtl.toByte())
+                } else innerPacket
+                processIncomingPacket(inner, fromAddress, fromFragment = true)
             }
         }
 
-        // Relay fragment
-        if (BlemeshProtocol.shouldRelay(packet)) {
+        // Relay raw fragments only: a nested inner FRAGMENT's carriers were
+        // already relayed hop-by-hop as they arrived.
+        if (!fromFragment && BlemeshProtocol.shouldRelay(packet)) {
             scope.launch {
                 delay(BlemeshProtocol.getRelayJitterMs().toLong())
                 broadcastPacketExcluding(packet.withDecrementedTTL(), fromAddress)
@@ -918,7 +951,7 @@ class BleMeshService(
 
     private fun handleAnnounce(packet: BlemeshPacket, fromAddress: String) {
         val announcement = AnnouncementData.decode(packet.payload) ?: return
-        val peerID = derivePeerID(announcement.noisePublicKey)
+        val peerID = PeerID.fromNoisePublicKey(announcement.noisePublicKey)
 
         // Only map direct announces (max TTL = direct connection)
         if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
@@ -952,6 +985,14 @@ class BleMeshService(
             java.util.Collections.synchronizedSet(mutableSetOf())
         }
         legs.add(fromAddress)
+        // Sweep legs whose link is already gone: a rotated-away address whose
+        // disconnect callback hasn't fired yet (or got dropped from
+        // addressToPeerID above) must not linger here — a dead leg keeps the
+        // peer "reachable" and directed traffic never falls through to the
+        // bridge.
+        synchronized(legs) {
+            legs.retainAll { it == fromAddress || connectedPeers.containsKey(it) }
+        }
 
         // Replay any packets we held for this peer while it was off-air. Even
         // if isNewMapping is false (same address re-ANNOUNCEs us), a buffer
@@ -981,9 +1022,10 @@ class BleMeshService(
     }
 
     private fun broadcastPacketExcluding(packet: BlemeshPacket, excludeAddress: String) {
+        val encoded = BinaryProtocol.encode(packet) ?: return
         for ((address, connection) in connectedPeers) {
             if (address != excludeAddress) {
-                sendPacketToConnection(connection, packet)
+                sendPacketToConnection(connection, packet, encoded)
             }
         }
     }
@@ -999,20 +1041,44 @@ class BleMeshService(
      * instead of being reborn at MAX_TTL, and local-only (ttl=0) packets stay
      * local even when fragmented.
      */
-    private fun sendPacketToConnection(connection: PeerConnection, packet: BlemeshPacket) {
-        val encoded = BinaryProtocol.encode(packet) ?: return
+    private fun sendPacketToConnection(
+        connection: PeerConnection,
+        packet: BlemeshPacket,
+        preEncoded: ByteArray? = null
+    ) {
+        val encoded = preEncoded ?: BinaryProtocol.encode(packet) ?: return
         val maxSingleWrite = (connection.mtu - 3).coerceIn(20, 185)
 
         if (encoded.size <= maxSingleWrite) {
-            writeToConnection(connection, encoded)
+            // Off the caller's thread: callers are often GATT binder callbacks
+            // and writeToConnection blocks (lock wait + pacing/retry sleeps).
+            // Dispatchers.IO because the write machinery genuinely blocks —
+            // parking Default-pool threads freezes scans/announces/gossip.
+            scope.launch(Dispatchers.IO) {
+                writeToConnection(connection, encoded)
+            }
             return
         }
 
-        val safeChunk = (maxSingleWrite - BLEMESH_PACKET_OVERHEAD - FRAGMENT_HEADER_BYTES).coerceAtLeast(20)
+        val safeChunk = maxSingleWrite - BLEMESH_PACKET_OVERHEAD - FRAGMENT_HEADER_BYTES
+        if (safeChunk < 1) {
+            // Pre-negotiation budget (MTU 23 → 20B writable) can't fit even a
+            // 1-byte fragment frame (~43B of packet + fragment overhead).
+            // Writing anyway emits frames the peer's stack truncates, so park
+            // the packet until onMtuChanged flushes the queue.
+            synchronized(connection.pendingUntilMtu) {
+                if (connection.pendingUntilMtu.size >= PENDING_MTU_QUEUE_MAX) {
+                    connection.pendingUntilMtu.removeAt(0)
+                }
+                connection.pendingUntilMtu.add(packet)
+            }
+            Log.d(TAG, "Deferred ${encoded.size}B packet for ${connection.address} until MTU negotiation (budget=${maxSingleWrite}B)")
+            return
+        }
         val fragments = fragmentationManager.split(encoded, packet.type, safeChunk)
         val recipientFlag = if (!packet.isBroadcast) BlemeshPacket.FLAG_HAS_RECIPIENT else 0
 
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             for (fragment in fragments) {
                 val payload = java.io.ByteArrayOutputStream().apply {
                     write(fragment.id)
@@ -1114,8 +1180,10 @@ class BleMeshService(
             val device = subscribedCentrals.firstOrNull { it.address == connection.address }
                 ?: return false
             try {
-                serverChar.value = data
-                gattServer?.notifyCharacteristicChanged(device, serverChar, false) == true
+                synchronized(serverNotifyLock) {
+                    serverChar.value = data
+                    gattServer?.notifyCharacteristicChanged(device, serverChar, false) == true
+                }
             } catch (e: SecurityException) {
                 Log.w(TAG, "Notify failed: ${e.message}")
                 false
@@ -1126,33 +1194,40 @@ class BleMeshService(
     private fun handleDisconnection(address: String) {
         connectedPeers.remove(address)
         addressToRssi.remove(address)
-        val peerID = addressToPeerID.remove(address)
-        if (peerID != null) {
-            // Remove this leg from the peer's live-address set. Only treat the
-            // peer as fully disconnected when no live legs remain — otherwise
-            // the other leg (server-side ↔ client-side) is still delivering.
-            val legs = peerToLiveAddresses[peerID]
-            val stillReachable = if (legs != null) {
-                legs.remove(address)
-                val any = legs.isNotEmpty()
-                if (!any) peerToLiveAddresses.remove(peerID)
-                any
-            } else false
+        addressToPeerID.remove(address)
 
-            if (!stillReachable) {
+        // Prune this address from EVERY peer's live-leg set, not just the
+        // peer addressToPeerID currently maps it to: handleAnnounce unmaps a
+        // rotated-away address immediately while its leg stays registered
+        // until this callback fires, and a leg that is never pruned keeps the
+        // peer "reachable" on a dead handle forever.
+        for ((peerID, legs) in peerToLiveAddresses) {
+            // Removal, emptiness check, and survivor pick must be atomic:
+            // both legs of a dual-leg peer can disconnect on separate binder
+            // threads, and a synchronizedSet only locks individual calls.
+            val removed: Boolean
+            val survivor: String?
+            synchronized(legs) {
+                removed = legs.remove(address)
+                survivor = if (removed) legs.firstOrNull() else null
+            }
+            if (!removed) continue
+
+            if (survivor == null) {
+                peerToLiveAddresses.remove(peerID, legs)
                 peerIdToAddress.remove(peerID)
                 packetListener?.onPeerDisconnected(peerID, address)
                 gossipSyncManager.removeAnnouncementForPeer(peerID)
             } else if (peerIdToAddress[peerID] == address) {
-                // The "primary" pointer was on the dropped leg. Move it to any
+                // The "primary" pointer was on the dropped leg. Move it to a
                 // surviving leg so sendPacketToPeer() and isLocalPeer() keep
                 // working.
-                peerIdToAddress[peerID] = legs!!.iterator().next()
+                peerIdToAddress[peerID] = survivor
             }
         }
     }
 
-private fun disconnectAll() {
+    private fun disconnectAll() {
         for ((address, connection) in connectedPeers) {
             try { connection.gatt?.disconnect() } catch (_: Exception) { }
             try { connection.gatt?.close() } catch (_: Exception) { }
@@ -1162,12 +1237,6 @@ private fun disconnectAll() {
         peerIdToAddress.clear()
         addressToRssi.clear()
         peerToLiveAddresses.clear()
-    }
-
-    private fun derivePeerID(noisePublicKey: ByteArray): PeerID {
-        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(noisePublicKey)
-        val hex = digest.copyOfRange(0, 8).joinToString("") { "%02x".format(it) }
-        return PeerID(hex)
     }
 
     // --- Gossip Delegate ---

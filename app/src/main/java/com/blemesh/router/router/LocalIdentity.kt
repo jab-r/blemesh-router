@@ -10,7 +10,6 @@ import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.MessageDigest
 import java.security.SecureRandom
 
 /**
@@ -86,8 +85,7 @@ object LocalIdentity {
         val noisePublic = ByteArray(32).also { noisePrivate.generatePublicKey().encode(it, 0) }
         val signingPublic = ByteArray(32).also { signingPrivate.generatePublicKey().encode(it, 0) }
 
-        val digest = MessageDigest.getInstance("SHA-256").digest(noisePublic)
-        val peerID = PeerID.fromBytes(digest.copyOfRange(0, 8))!!
+        val peerID = PeerID.fromNoisePublicKey(noisePublic)
 
         return RouterIdentity(
             peerID = peerID,

@@ -100,7 +100,11 @@ object GCSFilter {
 
     fun bucket(id: ByteArray, modulus: Long): Long {
         if (modulus <= 0) return 0
-        return h64(id) % modulus
+        // Same 0→1 remap as buildFilter (and iOS GCSFilter): the Rice stream
+        // can never encode bucket 0 (decoder adds +1 per delta), so a raw
+        // bucket-0 query would always miss and the packet would be re-sent
+        // on every sync round forever.
+        return (h64(id) % modulus).let { if (it == 0L) 1L else it }
     }
 
     internal fun h64(id16: ByteArray): Long {
