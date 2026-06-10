@@ -17,6 +17,19 @@ enum class MessageType(val value: Byte) {
     NOISE_HANDSHAKE(0x10),
     NOISE_ENCRYPTED(0x12),
     NOISE_IDENTITY_ANNOUNCE(0x13),
+    PRIVATE_MESSAGE(0x1A),
+
+    // Protocol negotiation / reliability (loxation-android + loxation-sw)
+    VERSION_HELLO(0x20),
+    VERSION_ACK(0x21),
+    PROTOCOL_ACK(0x22),
+    PROTOCOL_NACK(0x23),
+    SYSTEM_VALIDATION(0x24),
+    HANDSHAKE_REQUEST(0x25),
+
+    // Social
+    FAVORITED(0x30),
+    UNFAVORITED(0x31),
 
     // Loxation custom messages
     LOXATION_ANNOUNCE(0x40),
@@ -27,9 +40,16 @@ enum class MessageType(val value: Byte) {
     // Location and proximity
     LOCATION_UPDATE(0x44),
     UWB_RANGING(0x45),
+    PROXIMITY_ALERT(0x46),
+    BEACON_CONTEXT(0x47),
 
     // MLS over BLE
     MLS_MESSAGE(0x48),
+    UWB_TOKEN_EXCHANGE(0x49),
+
+    // WebRTC signaling
+    WEBRTC_SDP(0x50),
+    WEBRTC_ICE(0x51),
 
     // Gossip sync
     REQUEST_SYNC(0x60),

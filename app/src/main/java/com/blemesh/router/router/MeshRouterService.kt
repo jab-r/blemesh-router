@@ -58,28 +58,18 @@ class MeshRouterService : Service() {
             private set
 
         /**
-         * Packet types that should be routed over a Wi-Fi bridge (not just
-         * local BLE relay). UWB_RANGING is excluded — ranging is meaningful
-         * only within BLE radio range.
+         * Packet types that must NOT cross a Wi-Fi bridge. Everything else is
+         * bridged, including type codes this build doesn't know by name —
+         * an include-list silently broke cross-segment PROTOCOL_ACK /
+         * HANDSHAKE_REQUEST / version negotiation between reference peers.
+         *
+         * ROUTER_PING/PONG are router-internal control traffic; UWB_RANGING
+         * is meaningful only within BLE radio range.
          */
-        private val ROUTABLE_TYPES: Set<Int> = setOf(
-            MessageType.ANNOUNCE.value.toInt() and 0xFF,
-            MessageType.LEAVE.value.toInt() and 0xFF,
-            MessageType.MESSAGE.value.toInt() and 0xFF,
-            MessageType.FRAGMENT.value.toInt() and 0xFF,
-            MessageType.DELIVERY_ACK.value.toInt() and 0xFF,
-            MessageType.DELIVERY_STATUS_REQUEST.value.toInt() and 0xFF,
-            MessageType.READ_RECEIPT.value.toInt() and 0xFF,
-            MessageType.NOISE_HANDSHAKE.value.toInt() and 0xFF,
-            MessageType.NOISE_ENCRYPTED.value.toInt() and 0xFF,
-            MessageType.NOISE_IDENTITY_ANNOUNCE.value.toInt() and 0xFF,
-            MessageType.LOXATION_ANNOUNCE.value.toInt() and 0xFF,
-            MessageType.LOXATION_QUERY.value.toInt() and 0xFF,
-            MessageType.LOXATION_CHUNK.value.toInt() and 0xFF,
-            MessageType.LOXATION_COMPLETE.value.toInt() and 0xFF,
-            MessageType.LOCATION_UPDATE.value.toInt() and 0xFF,
-            MessageType.MLS_MESSAGE.value.toInt() and 0xFF,
-            MessageType.REQUEST_SYNC.value.toInt() and 0xFF,
+        private val NON_ROUTABLE_TYPES: Set<Int> = setOf(
+            MessageType.UWB_RANGING.value.toInt() and 0xFF,
+            MessageType.ROUTER_PING.value.toInt() and 0xFF,
+            MessageType.ROUTER_PONG.value.toInt() and 0xFF,
         )
     }
 
@@ -90,9 +80,10 @@ class MeshRouterService : Service() {
     private lateinit var transports: List<RouterTransport>
     private lateinit var lanDiscovery: LanPeerDiscovery
 
-    // Dedup for packets crossing the BLE↔bridge boundary
+    // Dedup for packets crossing the BLE↔bridge boundary. Window matches the
+    // references' 5-minute dedup so a late replay can't loop between routers.
     private val bridgeDeduplicator = MessageDeduplicator(
-        maxAgeMillis = 60_000L,
+        maxAgeMillis = 5 * 60_000L,
         maxEntries = 2000
     )
 
@@ -119,10 +110,11 @@ class MeshRouterService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        myPeerID = LocalIdentity.load(this)
+        val identity = LocalIdentity.load(this)
+        myPeerID = identity.peerID
         Log.i(TAG, "MeshRouterService created, PeerID: ${myPeerID.rawValue}")
 
-        bleMeshService = BleMeshService(this, myPeerID, serviceScope)
+        bleMeshService = BleMeshService(this, identity, serviceScope)
         bleMeshService.packetListener = blePacketListener
 
         transports = TransportSelector.build(this, myPeerID, serviceScope)
@@ -253,39 +245,62 @@ class MeshRouterService : Service() {
 
     private fun routeBlePacketToBridge(packet: BlemeshPacket) {
         val typeInt = packet.type.toInt() and 0xFF
-        if (typeInt !in ROUTABLE_TYPES) return
-
-        // Don't bridge local-only REQUEST_SYNC (TTL=0)
-        if (packet.type == MessageType.REQUEST_SYNC.value && (packet.ttl.toInt() and 0xFF) == 0) return
+        if (typeInt in NON_ROUTABLE_TYPES) return
 
         val dedupKey = "ble2br-${packet.senderId}-${packet.timestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
         val tag = packetTag(packet)
         trackRetry("ble→br", packet)
-        if (packet.isBroadcast) {
-            Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
-            for (t in transports) t.broadcast(packet)
-            bleToBridgeCount++
-            return
-        }
 
         val recipient = packet.recipientPeerID()
         if (recipient != null && bleMeshService.isLocalPeer(recipient)) {
-            Log.d(TAG, "BLE→bridge SKIP (recipient local) $tag")
-            return  // already deliverable locally
+            // Both endpoints are local. The router is the most reliable path
+            // between them: peer-to-peer BLE may be weak (the very reason we
+            // exist), and NOISE_ENCRYPTED bypasses BLE-mesh relay entirely
+            // (BlemeshProtocol.shouldRelay returns false for type 0x12), so
+            // without an explicit targeted write the recipient never sees it.
+            //
+            // Write to every live BLE leg of the recipient: iOS routinely
+            // holds two simultaneous connections (server-side accept +
+            // client-side dial) and the "primary" address bounces sub-second
+            // under reconnect churn. Hitting all legs makes us robust to that
+            // race; the recipient dedups duplicates.
+            //
+            // Decrement TTL before delivering: reference peers treat a packet
+            // arriving at MAX_TTL as proof of a direct connection and bind the
+            // sending BLE address (ours) to the packet's sender PeerID. The
+            // hop through us must not masquerade as the original sender.
+            val delivered = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+            val sent = bleMeshService.sendPacketToAllLegs(recipient, delivered)
+            Log.d(TAG, "BLE→bridge LOCAL-DELIVER $tag legs=$sent")
+            return
+        }
+
+        // Crossing the bridge is a hop: require a relayable TTL and spend one
+        // unit, exactly like a BLE relay. This also keeps local-only (ttl=0)
+        // gossip replays from leaking into remote segments, and ensures the
+        // packet never arrives at a remote phone at MAX_TTL (see above).
+        if ((packet.ttl.toInt() and 0xFF) <= 1) return
+        val bridged = packet.withDecrementedTTL()
+
+        if (bridged.isBroadcast) {
+            Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
+            for (t in transports) t.broadcast(bridged)
+            bleToBridgeCount++
+            return
         }
 
         // Directed: send via the transport that has the recipient if any,
         // otherwise broadcast to all transports.
         val targeted = recipient?.let { r ->
-            transports.firstOrNull { r in it.connectedPeerIDs() }?.also { it.sendToPeer(r, packet) }
+            transports.firstOrNull { r in it.connectedPeerIDs() }?.also { it.sendToPeer(r, bridged) }
         }
         if (targeted != null) {
             Log.d(TAG, "BLE→bridge DIRECT $tag via ${targeted.name}")
         } else {
             Log.d(TAG, "BLE→bridge FANOUT $tag via ${transports.joinToString(",") { it.name }}")
-            for (t in transports) t.broadcast(packet)
+            for (t in transports) t.broadcast(bridged)
         }
         bleToBridgeCount++
     }
@@ -382,12 +397,16 @@ class MeshRouterService : Service() {
         bridgeToBleCount++
 
         // Multi-hop: forward to other router peers (across all transports)
-        // excluding the one we just heard it from.
+        // excluding the one we just heard it from. Each router-to-router hop
+        // spends TTL like any other hop, so bridge loops are bounded by TTL
+        // as well as by the dedup window.
+        if ((packet.ttl.toInt() and 0xFF) <= 1) return
+        val forwarded = packet.withDecrementedTTL()
         val fwdTargets = mutableListOf<String>()
         for (t in transports) {
             for (peerID in t.connectedPeerIDs()) {
                 if (t === fromTransport && peerID == fromRouter) continue
-                t.sendToPeer(peerID, packet)
+                t.sendToPeer(peerID, forwarded)
                 fwdTargets += "${t.name}:${peerID.rawValue.take(8)}"
             }
         }

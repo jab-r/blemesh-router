@@ -11,6 +11,7 @@ import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.protocol.BlemeshProtocol
+import com.blemesh.router.router.LocalIdentity
 import com.blemesh.router.sync.GossipSyncManager
 import com.blemesh.router.sync.RequestSyncManager
 import com.blemesh.router.sync.RequestSyncPacket
@@ -18,6 +19,9 @@ import com.blemesh.router.util.MessageDeduplicator
 import kotlinx.coroutines.*
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 /**
  * BLE Mesh Service for the router.
@@ -34,9 +38,11 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class BleMeshService(
     private val context: Context,
-    private val myPeerID: PeerID,
+    private val identity: LocalIdentity.RouterIdentity,
     private val scope: CoroutineScope
 ) {
+    val myPeerID: PeerID = identity.peerID
+
     companion object {
         private const val TAG = "BleMeshService"
 
@@ -44,9 +50,24 @@ class BleMeshService(
         val CHARACTERISTIC_UUID: UUID = UUID.fromString("A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5E")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        private const val DEFAULT_MTU = 512
+        // ATT default until the link negotiates a larger MTU (onMtuChanged on
+        // either role). Assuming a big MTU before negotiation produces notifies
+        // the peer's stack silently truncates.
+        private const val DEFAULT_MTU = 23
+        // Field-proven request value from loxation-android.
+        private const val REQUEST_MTU = 247
         private const val SCAN_RESTART_INTERVAL_MS = 30_000L
         private const val RSSI_POLL_INTERVAL_MS = 15_000L
+        private const val ANNOUNCE_INTERVAL_MS = 30_000L
+
+        // GATT write serialization (mirrors loxation-android writeChunkedWWR):
+        // Android fails a writeCharacteristic()/notify issued while one is
+        // pending (returns false, frame silently lost), so writes per
+        // connection are serialized with pacing and retry.
+        private const val WRITE_LOCK_TIMEOUT_MS = 500L
+        private const val GATT_WRITE_PACING_MS = 8L
+        private const val GATT_WRITE_RETRY_DELAY_MS = 20L
+        private const val GATT_WRITE_MAX_RETRIES = 3
 
         // Store-and-forward bounds.
         // Per-peer ring depth: enough for a noise handshake (3-4 frames) plus a
@@ -109,6 +130,11 @@ class BleMeshService(
     private var bleScanner: BluetoothLeScanner? = null
     private var bleAdvertiser: BluetoothLeAdvertiser? = null
     private var gattServer: BluetoothGattServer? = null
+    private var serverCharacteristic: BluetoothGattCharacteristic? = null
+    // Centrals that enabled notifications via CCCD. Notifying a central that
+    // never subscribed violates GATT and confuses reference stacks.
+    private val subscribedCentrals = CopyOnWriteArraySet<BluetoothDevice>()
+    private var announceJob: Job? = null
 
     // Connected peers: BLE address -> connection state
     private val connectedPeers = ConcurrentHashMap<String, PeerConnection>()
@@ -127,6 +153,14 @@ class BleMeshService(
     // we don't buffer packets for peers we've never directly served, since
     // those flow only over the bridge.
     private val knownLocalPeers: MutableSet<PeerID> = ConcurrentHashMap.newKeySet()
+
+    // All currently live BLE addresses observed for a given peer. iOS clients
+    // routinely surface as TWO simultaneous connections to us (server-side
+    // accept + client-side dial, or RPA + identity-resolved), and the address
+    // bounces sub-second under reconnect churn. Writing to a single "latest"
+    // address often hits the leg that just dropped; writing to every live leg
+    // is what reliably reaches the phone.
+    private val peerToLiveAddresses: ConcurrentHashMap<PeerID, MutableSet<String>> = ConcurrentHashMap()
 
     // Store-and-forward buffer: PeerID -> FIFO of (packet, enqueue-ts).
     // Holds directed packets for a known local peer while it is briefly
@@ -155,7 +189,10 @@ class BleMeshService(
         val address: String,
         val gatt: BluetoothGatt? = null,
         val mtu: Int = DEFAULT_MTU,
-        var characteristic: BluetoothGattCharacteristic? = null
+        var characteristic: BluetoothGattCharacteristic? = null,
+        // Serializes GATT writes per connection. copy() carries the same
+        // instance forward, so the lock survives mtu/characteristic updates.
+        val writeLock: Semaphore = Semaphore(1)
     )
 
     // --- Lifecycle ---
@@ -173,6 +210,7 @@ class BleMeshService(
         startScanning()
         startRssiPolling()
         startSnfSweep()
+        startAnnouncing()
     }
 
     fun stop() {
@@ -181,6 +219,7 @@ class BleMeshService(
         Log.i(TAG, "Stopping BLE mesh service")
 
         gossipSyncManager.stop()
+        stopAnnouncing()
         stopScanning()
         stopRssiPolling()
         stopSnfSweep()
@@ -189,6 +228,7 @@ class BleMeshService(
         disconnectAll()
         pendingByPeer.clear()
         knownLocalPeers.clear()
+        peerToLiveAddresses.clear()
     }
 
     private fun startRssiPolling() {
@@ -252,18 +292,22 @@ class BleMeshService(
             queue.clear()
         }
         val now = System.currentTimeMillis()
-        var sent = 0
-        var dropped = 0
-        for (entry in snapshot) {
-            if (now - entry.enqueuedAtMs > SNF_MAX_AGE_MS) {
-                dropped++
-                continue
+        // Replay off the GATT binder thread: serialized writes pace at ~8ms
+        // per frame, and a full ring would stall callback delivery otherwise.
+        scope.launch {
+            var sent = 0
+            var dropped = 0
+            for (entry in snapshot) {
+                if (now - entry.enqueuedAtMs > SNF_MAX_AGE_MS) {
+                    dropped++
+                    continue
+                }
+                sendPacketToAllLegs(peerID, entry.packet)
+                sent++
             }
-            sendPacketToPeer(peerID, entry.packet)
-            sent++
-        }
-        if (sent > 0 || dropped > 0) {
-            Log.i(TAG, "S&F replay ${peerID.rawValue.take(8)}: sent=$sent dropped=$dropped")
+            if (sent > 0 || dropped > 0) {
+                Log.i(TAG, "S&F replay ${peerID.rawValue.take(8)}: sent=$sent dropped=$dropped")
+            }
         }
     }
 
@@ -290,6 +334,55 @@ class BleMeshService(
     private fun stopSnfSweep() {
         snfSweepJob?.cancel()
         snfSweepJob = null
+    }
+
+    // --- Identity announce ---
+
+    /**
+     * Periodic signed ANNOUNCE so reference peers can bind our BLE address to
+     * our PeerID (loxation-android announces every 30s; iOS announces shortly
+     * after subscription events). Without it the router is invisible in peer
+     * lists and directed traffic to us degrades to broadcast.
+     */
+    private fun startAnnouncing() {
+        announceJob?.cancel()
+        announceJob = scope.launch {
+            delay(1_000)
+            while (isActive && isRunning) {
+                sendLocalAnnounce()
+                delay(ANNOUNCE_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopAnnouncing() {
+        announceJob?.cancel()
+        announceJob = null
+    }
+
+    private fun sendLocalAnnounce() {
+        if (connectedPeers.isEmpty()) return
+        val payload = AnnouncementData(
+            nickname = identity.nickname,
+            noisePublicKey = identity.noisePublicKey,
+            signingPublicKey = identity.signingPublicKey
+        ).encode()
+        if (payload.isEmpty()) return
+
+        val unsigned = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ANNOUNCE.value,
+            ttl = BlemeshPacket.MAX_TTL.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = 0,
+            senderId = myPeerID.toLongBE(),
+            recipientId = BlemeshPacket.BROADCAST_ADDRESS,
+            payload = payload,
+            signature = null
+        )
+        val packet = unsigned.copy(signature = identity.signPacket(unsigned))
+        gossipSyncManager.onPublicPacketSeen(packet)
+        broadcastPacket(packet)
     }
 
     // --- Public API ---
@@ -332,6 +425,31 @@ class BleMeshService(
         }
         val connection = connectedPeers[address] ?: return
         sendPacketToConnection(connection, packet)
+    }
+
+    /**
+     * Send a packet to every live BLE address we currently have for [peerID].
+     * Use this for delivery of directed packets where the recipient may hold
+     * multiple simultaneous connections to us (dual-leg). Each phone dedups,
+     * so duplicate writes are harmless; missing the live leg is not.
+     */
+    fun sendPacketToAllLegs(peerID: PeerID, packet: BlemeshPacket): Int {
+        val addrs = peerToLiveAddresses[peerID]
+        if (addrs.isNullOrEmpty()) {
+            // Fall back to the legacy single-address path (and its broadcast
+            // fallback for completely-unmapped peers).
+            sendPacketToPeer(peerID, packet)
+            return 0
+        }
+        var sent = 0
+        // Snapshot to avoid ConcurrentModification mid-iteration.
+        val snapshot = synchronized(addrs) { addrs.toList() }
+        for (addr in snapshot) {
+            val conn = connectedPeers[addr] ?: continue
+            sendPacketToConnection(conn, packet)
+            sent++
+        }
+        return sent
     }
 
     /** Send raw pre-encoded data to all connected peers. Caller is responsible for MTU sizing. */
@@ -473,8 +591,17 @@ class BleMeshService(
                 BluetoothGattCharacteristic.PERMISSION_READ or
                         BluetoothGattCharacteristic.PERMISSION_WRITE
             )
+            // CCCD (0x2902) — without it, an iOS central's setNotifyValue(true)
+            // fails silently at the ATT layer and the central never receives
+            // notifications from us.
+            val cccd = BluetoothGattDescriptor(
+                CCCD_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+            )
+            characteristic.addDescriptor(cccd)
             service.addCharacteristic(characteristic)
             gattServer?.addService(service)
+            serverCharacteristic = characteristic
             Log.d(TAG, "GATT server started")
         } catch (e: SecurityException) {
             Log.e(TAG, "Missing BLE connect permission", e)
@@ -486,6 +613,8 @@ class BleMeshService(
             gattServer?.close()
         } catch (_: Exception) { }
         gattServer = null
+        serverCharacteristic = null
+        subscribedCentrals.clear()
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
@@ -496,7 +625,15 @@ class BleMeshService(
                 connectedPeers.putIfAbsent(address, PeerConnection(address = address))
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "GATT server: peer disconnected $address")
+                subscribedCentrals.filter { it.address == address }
+                    .forEach { subscribedCentrals.remove(it) }
                 handleDisconnection(address)
+            }
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            connectedPeers[device.address]?.let {
+                connectedPeers[device.address] = it.copy(mtu = mtu)
             }
         }
 
@@ -511,6 +648,55 @@ class BleMeshService(
         ) {
             if (characteristic.uuid == CHARACTERISTIC_UUID) {
                 handleIncomingData(value, device.address)
+            }
+            if (responseNeeded) {
+                try {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                } catch (_: SecurityException) { }
+            }
+        }
+
+        override fun onCharacteristicReadRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            offset: Int,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            // Mesh traffic flows via writes/notifies; answer reads with an
+            // empty value so the peer doesn't hang into a 30s GATT timeout.
+            try {
+                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, ByteArray(0))
+            } catch (_: SecurityException) { }
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (descriptor.uuid == CCCD_UUID) {
+                val enable = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ||
+                        value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+                if (enable) {
+                    val isNew = subscribedCentrals.add(device)
+                    Log.d(TAG, "GATT server: ${device.address} subscribed (new=$isNew)")
+                    if (isNew) {
+                        // Announce shortly after subscription so the central can
+                        // bind our address to our PeerID (iOS announces 0.4s
+                        // after a central subscribes).
+                        scope.launch {
+                            delay(400)
+                            sendLocalAnnounce()
+                        }
+                    }
+                } else {
+                    subscribedCentrals.remove(device)
+                    Log.d(TAG, "GATT server: ${device.address} unsubscribed")
+                }
             }
             if (responseNeeded) {
                 try {
@@ -536,8 +722,14 @@ class BleMeshService(
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.d(TAG, "GATT client: connected to $address")
                 connectedPeers[address] = PeerConnection(address = address, gatt = gatt)
+                // Request a bigger MTU but don't gate discovery on the callback:
+                // if requestMtu fails or onMtuChanged never fires, the link must
+                // still come up (writes just stay at the 20-byte default budget).
                 try {
-                    gatt.requestMtu(DEFAULT_MTU)
+                    gatt.requestMtu(REQUEST_MTU)
+                } catch (_: SecurityException) { }
+                try {
+                    gatt.discoverServices()
                 } catch (_: SecurityException) { }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "GATT client: disconnected from $address")
@@ -547,13 +739,11 @@ class BleMeshService(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) return
             val address = gatt.device.address
             connectedPeers[address]?.let {
                 connectedPeers[address] = it.copy(mtu = mtu)
             }
-            try {
-                gatt.discoverServices()
-            } catch (_: SecurityException) { }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -585,6 +775,13 @@ class BleMeshService(
             }
 
             Log.d(TAG, "Services discovered for $address, ready for data")
+
+            // Announce on this fresh link so the peripheral can bind our
+            // address to our PeerID (mirrors reference gatt_ready announce).
+            scope.launch {
+                delay(500)
+                sendLocalAnnounce()
+            }
         }
 
         override fun onCharacteristicChanged(
@@ -619,16 +816,33 @@ class BleMeshService(
 
     private fun handleIncomingData(data: ByteArray, fromAddress: String) {
         val packet = BinaryProtocol.decode(data) ?: return
+        processIncomingPacket(packet, fromAddress, fromFragment = false)
+    }
 
-        // Dedup
+    /**
+     * Full receive pipeline: dedup, fragment reassembly, ANNOUNCE / REQUEST_SYNC
+     * handling, gossip tracking, bridge listener, BLE relay.
+     *
+     * Reassembled inner packets re-enter here with [fromFragment] = true so a
+     * fragmented ANNOUNCE or REQUEST_SYNC affects router state exactly like an
+     * unfragmented one (both references do this). Inner packets skip the relay
+     * step — the raw fragments were already relayed hop-by-hop.
+     */
+    private fun processIncomingPacket(packet: BlemeshPacket, fromAddress: String, fromFragment: Boolean) {
+        // Dedup. Inner packets get deduped too: this is what stops a packet we
+        // injected from WiFi, re-fragmented, and heard echoed back from being
+        // re-broadcast over the bridge a second time.
         val packetId = buildDeduplicationKey(packet)
         if (deduplicator.isDuplicate(packetId)) return
 
         val messageType = MessageType.from(packet.type)
 
-        // Handle fragments
-        if (messageType == MessageType.FRAGMENT && packet.payload.size >= 10) {
-            handleFragment(packet, fromAddress)
+        // Handle fragments. Malformed FRAGMENTs (payload < 13-byte header) are
+        // dropped — never fall through to the generic path (matches references).
+        if (messageType == MessageType.FRAGMENT) {
+            if (!fromFragment && packet.payload.size >= 13) {
+                handleFragment(packet, fromAddress)
+            }
             return
         }
 
@@ -646,11 +860,22 @@ class BleMeshService(
         // Track in gossip sync
         gossipSyncManager.onPublicPacketSeen(packet)
 
+        // Packets addressed to this router itself (e.g. a NOISE_HANDSHAKE a
+        // phone initiates toward us after seeing our announce) terminate here:
+        // never bridged, never relayed back out.
+        val isForMe = !packet.isBroadcast && packet.recipientPeerID() == myPeerID
+        if (isForMe) {
+            if (messageType != MessageType.ANNOUNCE) {
+                Log.d(TAG, "Ignoring packet addressed to router: type=0x%02x".format(packet.type.toInt() and 0xFF))
+            }
+            return
+        }
+
         // Notify listener
         packetListener?.onPacketReceived(packet, fromAddress)
 
         // Relay if appropriate
-        if (BlemeshProtocol.shouldRelay(packet)) {
+        if (!fromFragment && BlemeshProtocol.shouldRelay(packet)) {
             // Also buffer the relayed copy for the directed recipient if they
             // are a known-local peer that is currently disconnected.
             val relayed = packet.withDecrementedTTL()
@@ -678,7 +903,7 @@ class BleMeshService(
         if (reassembled != null) {
             val innerPacket = BinaryProtocol.decode(reassembled)
             if (innerPacket != null) {
-                packetListener?.onPacketReceived(innerPacket, fromAddress)
+                processIncomingPacket(innerPacket, fromAddress, fromFragment = true)
             }
         }
 
@@ -698,29 +923,35 @@ class BleMeshService(
         // Only map direct announces (max TTL = direct connection)
         if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
 
-        // Evict any prior address for this peer. Loxation/iOS clients rotate
-        // their BLE resolvable private address every ~15 min, and dual-leg
-        // server+client connections to the same peer can surface under
-        // different addresses on Android's stack. Without eviction, the same
-        // PeerID accumulates under multiple address keys and getConnectedPeerIDs()
-        // reports the peer N times.
+        // Dedup the address→PeerID mapping so getConnectedPeerIDs() reports the
+        // peer once. Do NOT close the prior GATT/server connection here: when
+        // Android resolves an RPA against its IRK mid-session, or when the peer
+        // holds both a server-side and client-side connection to us (dual-leg,
+        // common with iOS Loxation), the same physical peer surfaces under two
+        // addresses simultaneously. Both are live. Closing one of them kills
+        // a working link and triggers a reconnect storm that compounds the
+        // loss instead of fixing it.
         //
-        // Critically: also tear down the stale GATT/server connection. Without
-        // this, broadcastPacket() iterates connectedPeers and writes to the dead
-        // physical link as well as the live one. Those writes succeed at the
-        // Android API layer (WRITE_NO_RESPONSE returns immediately) but are
-        // silently dropped on-air — the recipient never sees the packet. Most
-        // visibly impacts NOISE_HANDSHAKE retries and short encrypted messages
-        // sent during the brief window after an address rotation.
+        // Stale GATT entries left in connectedPeers are harmless on their own:
+        // writes to a dead handle return immediately at the Android API layer
+        // without delivering anything. The real fix for local→local directed
+        // delivery is targeted-write in MeshRouterService, not eviction here.
         val priorAddress = peerIdToAddress[peerID]
         if (priorAddress != null && priorAddress != fromAddress) {
             addressToPeerID.remove(priorAddress)
-            evictStaleConnection(priorAddress, peerID)
         }
 
         val isNewMapping = addressToPeerID.put(fromAddress, peerID) != peerID
         peerIdToAddress[peerID] = fromAddress
         knownLocalPeers.add(peerID)
+
+        // Record this address as a live leg for the peer. The set may already
+        // contain it (re-ANNOUNCE from the same leg) or contain another address
+        // (dual-leg). Both are fine.
+        val legs = peerToLiveAddresses.computeIfAbsent(peerID) {
+            java.util.Collections.synchronizedSet(mutableSetOf())
+        }
+        legs.add(fromAddress)
 
         // Replay any packets we held for this peer while it was off-air. Even
         // if isNewMapping is false (same address re-ANNOUNCEs us), a buffer
@@ -763,9 +994,10 @@ class BleMeshService(
      * payload header: [id:8][index:2 BE][total:2 BE][originalType:1]) matching
      * the loxation-android / loxation-sw wire format.
      *
-     * Each FRAGMENT wrapper uses this router's PeerID as sender and MAX_TTL so
-     * fragments can be relayed independently; reassembly recovers the inner
-     * packet's original sender/TTL.
+     * FRAGMENT wrappers carry the original packet's sender, timestamp, and TTL
+     * (loxation-sw behavior): relayed/bridged packets keep their hop budget
+     * instead of being reborn at MAX_TTL, and local-only (ttl=0) packets stay
+     * local even when fragmented.
      */
     private fun sendPacketToConnection(connection: PeerConnection, packet: BlemeshPacket) {
         val encoded = BinaryProtocol.encode(packet) ?: return
@@ -779,7 +1011,6 @@ class BleMeshService(
         val safeChunk = (maxSingleWrite - BLEMESH_PACKET_OVERHEAD - FRAGMENT_HEADER_BYTES).coerceAtLeast(20)
         val fragments = fragmentationManager.split(encoded, packet.type, safeChunk)
         val recipientFlag = if (!packet.isBroadcast) BlemeshPacket.FLAG_HAS_RECIPIENT else 0
-        val senderLong = myPeerID.toLongBE()
 
         scope.launch {
             for (fragment in fragments) {
@@ -796,10 +1027,10 @@ class BleMeshService(
                 val fragmentPacket = BlemeshPacket(
                     version = BlemeshPacket.PROTOCOL_VERSION,
                     type = MessageType.FRAGMENT.value,
-                    ttl = BlemeshPacket.MAX_TTL.toByte(),
-                    timestamp = System.currentTimeMillis(),
+                    ttl = packet.ttl,
+                    timestamp = packet.timestamp,
                     flags = recipientFlag,
-                    senderId = senderLong,
+                    senderId = packet.senderId,
                     recipientId = packet.recipientId,
                     payload = payload,
                     signature = null
@@ -811,11 +1042,62 @@ class BleMeshService(
         }
     }
 
-    private fun writeToConnection(connection: PeerConnection, data: ByteArray) {
+    /**
+     * Serialized GATT write with retry, mirroring loxation-android's
+     * writeChunkedWWR: Android silently fails a write issued while another is
+     * pending on the same connection (returns false), so writes are serialized
+     * per connection with a pacing delay (WRITE_NO_RESPONSE has no completion
+     * callback) and retried with backoff on immediate failure.
+     */
+    private fun writeToConnection(connection: PeerConnection, data: ByteArray): Boolean {
+        // Server-side leg with no CCCD subscription: nothing to deliver to.
+        // Bail before the lock/retry machinery burns ~60ms per frame on it.
+        if ((connection.gatt == null || connection.characteristic == null) &&
+            subscribedCentrals.none { it.address == connection.address }
+        ) {
+            return false
+        }
+        val acquired = try {
+            connection.writeLock.tryAcquire(WRITE_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return false
+        }
+        if (!acquired) {
+            Log.w(TAG, "Write lock timeout for ${connection.address}, dropping ${data.size}B frame")
+            return false
+        }
+        try {
+            for (attempt in 1..GATT_WRITE_MAX_RETRIES) {
+                if (performWrite(connection, data)) {
+                    try {
+                        Thread.sleep(GATT_WRITE_PACING_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                    return true
+                }
+                if (attempt < GATT_WRITE_MAX_RETRIES) {
+                    try {
+                        Thread.sleep(GATT_WRITE_RETRY_DELAY_MS * attempt)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
+                }
+            }
+            Log.w(TAG, "Write exhausted retries for ${connection.address} (${data.size}B)")
+            return false
+        } finally {
+            connection.writeLock.release()
+        }
+    }
+
+    private fun performWrite(connection: PeerConnection, data: ByteArray): Boolean {
         val gatt = connection.gatt
         val char = connection.characteristic
 
-        if (gatt != null && char != null) {
+        return if (gatt != null && char != null) {
             // Client connection - write to remote characteristic
             try {
                 char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -823,18 +1105,20 @@ class BleMeshService(
                 gatt.writeCharacteristic(char)
             } catch (e: SecurityException) {
                 Log.w(TAG, "Write failed: ${e.message}")
+                false
             }
         } else {
-            // Server connection - notify
-            val device = bluetoothAdapter?.getRemoteDevice(connection.address) ?: return
+            // Server connection - notify, but only centrals that subscribed
+            // via CCCD (notifying an unsubscribed central violates GATT).
+            val serverChar = serverCharacteristic ?: return false
+            val device = subscribedCentrals.firstOrNull { it.address == connection.address }
+                ?: return false
             try {
-                val serverChar = gattServer?.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
-                if (serverChar != null) {
-                    serverChar.value = data
-                    gattServer?.notifyCharacteristicChanged(device, serverChar, false)
-                }
+                serverChar.value = data
+                gattServer?.notifyCharacteristicChanged(device, serverChar, false) == true
             } catch (e: SecurityException) {
                 Log.w(TAG, "Notify failed: ${e.message}")
+                false
             }
         }
     }
@@ -844,37 +1128,31 @@ class BleMeshService(
         addressToRssi.remove(address)
         val peerID = addressToPeerID.remove(address)
         if (peerID != null) {
-            peerIdToAddress.remove(peerID)
-            packetListener?.onPeerDisconnected(peerID, address)
-            gossipSyncManager.removeAnnouncementForPeer(peerID)
+            // Remove this leg from the peer's live-address set. Only treat the
+            // peer as fully disconnected when no live legs remain — otherwise
+            // the other leg (server-side ↔ client-side) is still delivering.
+            val legs = peerToLiveAddresses[peerID]
+            val stillReachable = if (legs != null) {
+                legs.remove(address)
+                val any = legs.isNotEmpty()
+                if (!any) peerToLiveAddresses.remove(peerID)
+                any
+            } else false
+
+            if (!stillReachable) {
+                peerIdToAddress.remove(peerID)
+                packetListener?.onPeerDisconnected(peerID, address)
+                gossipSyncManager.removeAnnouncementForPeer(peerID)
+            } else if (peerIdToAddress[peerID] == address) {
+                // The "primary" pointer was on the dropped leg. Move it to any
+                // surviving leg so sendPacketToPeer() and isLocalPeer() keep
+                // working.
+                peerIdToAddress[peerID] = legs!!.iterator().next()
+            }
         }
     }
 
-    /**
-     * Forcibly close the GATT/server connection for a stale BLE address.
-     * Called when a peer reannounces from a new address: the old physical
-     * link must stop receiving writes immediately so we don't fan out into
-     * a dead radio path.
-     */
-    private fun evictStaleConnection(address: String, peerID: PeerID) {
-        val conn = connectedPeers.remove(address) ?: return
-        addressToRssi.remove(address)
-        Log.i(TAG, "Evicting stale BLE connection $address for peer ${peerID.rawValue.take(8)}")
-        val gatt = conn.gatt
-        if (gatt != null) {
-            try { gatt.disconnect() } catch (_: SecurityException) {} catch (_: Exception) {}
-            try { gatt.close() } catch (_: Exception) {}
-        } else {
-            // Server-side connection: cancel from the server's side so Android
-            // tears down the link instead of waiting for the supervision timeout.
-            try {
-                val device = bluetoothAdapter?.getRemoteDevice(address)
-                if (device != null) gattServer?.cancelConnection(device)
-            } catch (_: SecurityException) {} catch (_: Exception) {}
-        }
-    }
-
-    private fun disconnectAll() {
+private fun disconnectAll() {
         for ((address, connection) in connectedPeers) {
             try { connection.gatt?.disconnect() } catch (_: Exception) { }
             try { connection.gatt?.close() } catch (_: Exception) { }
@@ -883,6 +1161,7 @@ class BleMeshService(
         addressToPeerID.clear()
         peerIdToAddress.clear()
         addressToRssi.clear()
+        peerToLiveAddresses.clear()
     }
 
     private fun derivePeerID(noisePublicKey: ByteArray): PeerID {

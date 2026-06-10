@@ -25,7 +25,12 @@ object CompressionUtil {
 
     fun compress(data: ByteArray): ByteArray? {
         if (data.size < COMPRESSION_THRESHOLD) return null
-        val deflater = Deflater(Deflater.DEFAULT_COMPRESSION)
+        // Raw DEFLATE (nowrap), NOT zlib-wrapped: Apple's Compression framework
+        // (COMPRESSION_ZLIB) only decodes raw DEFLATE, and iOS silently
+        // delivers corrupt bytes when handed a zlib stream. Both Kotlin
+        // decoders (ours and loxation-android's) try zlib first then fall back
+        // to raw, so raw is the only encoding every platform can read.
+        val deflater = Deflater(Deflater.DEFAULT_COMPRESSION, true)
         return try {
             deflater.setInput(data)
             deflater.finish()

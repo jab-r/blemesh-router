@@ -51,5 +51,14 @@ class MessageDeduplicator(
                 removed++
             }
         }
+        // Reference behavior: when the map is still over capacity after the
+        // age-based pass, hard-evict the oldest entries regardless of age so
+        // the map (and the per-insert scan) stays bounded under load.
+        if (seen.size > maxEntries) {
+            seen.entries
+                .sortedBy { it.value }
+                .take(trimBatchSize)
+                .forEach { seen.remove(it.key, it.value) }
+        }
     }
 }

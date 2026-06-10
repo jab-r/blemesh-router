@@ -48,16 +48,22 @@ object GCSFilter {
         val n = ids.size.coerceAtMost(nCap)
         val selected = ids.take(n)
         val m = (n.toLong() shl p)
-        val mapped = selected.map { id -> (h64(id) % m) }.sorted()
+        // Normalize like iOS GCSFilter: remap bucket 0 to 1 and drop duplicate
+        // buckets. The Rice encoder computes (delta - 1); a duplicate (delta=0)
+        // or a leading 0 underflows and silently corrupts every value after it.
+        val mapped = selected
+            .map { id -> (h64(id) % m).let { if (it == 0L) 1L else it } }
+            .distinct()
+            .sorted()
         var encoded = encode(mapped, p)
-        var trimmedN = n
-        while (encoded.size > maxBytes && trimmedN > 0) {
-            trimmedN = (trimmedN * 9) / 10
-            val mapped2 = mapped.take(trimmedN)
-            encoded = encode(mapped2, p)
+        var current = mapped
+        while (encoded.size > maxBytes && current.isNotEmpty()) {
+            current = current.take((current.size * 9) / 10)
+            encoded = encode(current, p)
         }
-        val finalM = (trimmedN.toLong() shl p)
-        return Params(p = p, m = finalM, data = encoded)
+        // Keep the original m even when trimmed (iOS behavior): m defines the
+        // hash domain the querier reduces into, not the encoded count.
+        return Params(p = p, m = m, data = encoded)
     }
 
     fun decodeToSortedSet(p: Int, m: Long, data: ByteArray): LongArray {

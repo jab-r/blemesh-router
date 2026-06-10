@@ -1,76 +1,75 @@
 package com.blemesh.router.protocol
 
+import java.io.ByteArrayOutputStream
+import java.security.SecureRandom
+
 /**
  * Message padding/unpadding for BLE transport.
- * Ported from loxation-android MessagePadding.
+ * Verbatim port of loxation-android MessagePadding (byte-compatible with
+ * loxation-sw): random fill, PKCS#7-style trailing length byte for padding
+ * up to 255 bytes, and a trailing [lenHi][lenLo][0x00] sentinel beyond that.
  */
 object MessagePadding {
-    private val BLOCK_SIZES = intArrayOf(256, 512, 1024, 2048, 4096)
-
-    fun optimalBlockSize(rawSize: Int): Int {
-        for (size in BLOCK_SIZES) {
-            if (rawSize <= size) return size
-        }
-        return rawSize
-    }
+    private val blockSizes = intArrayOf(256, 512, 1024, 2048, 4096)
+    private val random = SecureRandom()
 
     fun pad(data: ByteArray, targetSize: Int): ByteArray {
-        if (targetSize <= data.size) return data
+        if (data.size >= targetSize) return data
         val paddingNeeded = targetSize - data.size
         if (paddingNeeded <= 0) return data
 
-        val padded = ByteArray(targetSize)
-        System.arraycopy(data, 0, padded, 0, data.size)
+        val output = ByteArrayOutputStream(targetSize)
+        output.write(data)
 
-        if (paddingNeeded <= 256) {
-            // Single-byte length encoding
-            padded[data.size] = (paddingNeeded - 1).toByte()
-        } else {
-            // 3-byte header: 0xFF marker + 2-byte length
-            padded[data.size] = 0xFF.toByte()
-            val remaining = paddingNeeded - 1
-            padded[data.size + 1] = ((remaining shr 8) and 0xFF).toByte()
-            padded[data.size + 2] = (remaining and 0xFF).toByte()
+        if (paddingNeeded <= 255) {
+            if (paddingNeeded > 1) {
+                val randomBytes = ByteArray(paddingNeeded - 1)
+                random.nextBytes(randomBytes)
+                output.write(randomBytes)
+            }
+            output.write(paddingNeeded)
+            return output.toByteArray()
         }
 
-        return padded
+        val randomBytesCount = paddingNeeded - 3
+        if (randomBytesCount > 0) {
+            val randomBytes = ByteArray(randomBytesCount)
+            random.nextBytes(randomBytes)
+            output.write(randomBytes)
+        }
+
+        val high = (paddingNeeded shr 8) and 0xFF
+        val low = paddingNeeded and 0xFF
+        output.write(high)
+        output.write(low)
+        output.write(0)
+
+        return output.toByteArray()
     }
 
     fun unpad(data: ByteArray): ByteArray {
         if (data.isEmpty()) return data
-
-        // Check if the last byte could indicate padding
-        val lastByte = data[data.size - 1].toInt() and 0xFF
-        if (lastByte != 0) return data
-
-        // Walk backwards to find padding start
-        var i = data.size - 1
-        while (i >= 0 && data[i].toInt() == 0) {
-            i--
-        }
-        if (i < 0) return data
-
-        val marker = data[i].toInt() and 0xFF
-        val paddingLen: Int
-        val headerSize: Int
-
-        if (marker == 0xFF && i >= 2) {
-            // 3-byte header
-            val lenHi = data[i - 2].toInt() and 0xFF
-            val lenLo = data[i - 1].toInt() and 0xFF
-            paddingLen = (lenHi shl 8) or lenLo
-            headerSize = 3
-        } else {
-            paddingLen = marker
-            headerSize = 1
+        val last = data.last()
+        if (last.toInt() == 0) {
+            if (data.size < 3) return data
+            val high = data[data.size - 3].toInt() and 0xFF
+            val low = data[data.size - 2].toInt() and 0xFF
+            val paddingLength = (high shl 8) or low
+            if (paddingLength <= 0 || paddingLength > data.size) return data
+            return data.copyOf(data.size - paddingLength)
         }
 
-        val totalPadding = paddingLen + headerSize
-        if (totalPadding <= 0 || totalPadding > data.size) return data
+        val paddingLength = last.toInt() and 0xFF
+        if (paddingLength <= 0 || paddingLength > data.size) return data
+        return data.copyOf(data.size - paddingLength)
+    }
 
-        val contentEnd = data.size - totalPadding
-        if (contentEnd <= 0 || contentEnd >= data.size) return data
-
-        return data.copyOfRange(0, contentEnd)
+    fun optimalBlockSize(dataSize: Int): Int {
+        // +16 mirrors the references' allowance for encoding overhead.
+        val totalSize = dataSize + 16
+        for (block in blockSizes) {
+            if (totalSize <= block) return block
+        }
+        return dataSize
     }
 }

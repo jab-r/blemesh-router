@@ -107,4 +107,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.activity:activity-ktx:1.9.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    // X25519/Ed25519 (lightweight API, no JCA provider registration) for the
+    // router's Noise-static identity and signed ANNOUNCE frames.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 }

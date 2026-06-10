@@ -100,10 +100,23 @@ class BleMeshFragmentationManager {
         ): ByteArray? {
             if (total <= 0 || index < 0 || index >= total) return null
 
+            // Sweep expired transfers on every insert (references sweep per
+            // fragment / on a timer); the map is capped at 128 so this is cheap.
+            cleanup()
+
             val key = fragmentId.joinToString("") { "%02x".format(it) }
 
             val transfer = pending.getOrPut(key) {
-                if (pending.size >= maxTransfers) cleanup()
+                if (pending.size >= maxTransfers) {
+                    cleanup()
+                    // Still full of young incomplete transfers: evict the
+                    // oldest so the map stays bounded under fragment floods
+                    // (references evict-oldest at the same 128 cap).
+                    while (pending.size >= maxTransfers) {
+                        val oldest = pending.minByOrNull { it.value.createdAt }?.key ?: break
+                        pending.remove(oldest)
+                    }
+                }
                 PendingTransfer(
                     fragments = arrayOfNulls(total),
                     total = total,
