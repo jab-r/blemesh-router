@@ -20,6 +20,7 @@ data class SyncTypeFlags(val rawValue: Long) {
             MessageType.LOXATION_QUERY -> 7
             MessageType.LOXATION_CHUNK -> 8
             MessageType.LOXATION_COMPLETE -> 9
+            MessageType.LOCATION_UPDATE -> 10
             else -> null
         }
 
@@ -34,6 +35,7 @@ data class SyncTypeFlags(val rawValue: Long) {
             7 -> MessageType.LOXATION_QUERY
             8 -> MessageType.LOXATION_CHUNK
             9 -> MessageType.LOXATION_COMPLETE
+            10 -> MessageType.LOCATION_UPDATE
             else -> null
         }
 
@@ -41,6 +43,7 @@ data class SyncTypeFlags(val rawValue: Long) {
         val MESSAGE = fromTypes(MessageType.MESSAGE)
         val FRAGMENT = fromTypes(MessageType.FRAGMENT)
         val LOXATION_ANNOUNCE = fromTypes(MessageType.LOXATION_ANNOUNCE)
+        val LOCATION_UPDATE = fromTypes(MessageType.LOCATION_UPDATE)
         val PUBLIC_MESSAGES = fromTypes(MessageType.ANNOUNCE, MessageType.MESSAGE, MessageType.LOXATION_ANNOUNCE)
 
         fun fromTypes(vararg types: MessageType): SyncTypeFlags {

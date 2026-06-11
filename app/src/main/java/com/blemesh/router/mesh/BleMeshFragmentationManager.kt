@@ -89,9 +89,15 @@ class BleMeshFragmentationManager {
 
         /**
          * Add a fragment and return the reassembled data if all fragments received.
+         *
+         * Keyed on sender + fragment ID (matching both references): fragment
+         * IDs are random 8-byte values, so accidental collisions are
+         * negligible, but without the sender a malicious peer could reuse
+         * another sender's fragID and poison its in-flight transfer.
          */
         @Synchronized
         fun addFragment(
+            senderId: Long,
             fragmentId: ByteArray,
             index: Int,
             total: Int,
@@ -104,7 +110,7 @@ class BleMeshFragmentationManager {
             // fragment / on a timer); the map is capped at 128 so this is cheap.
             cleanup()
 
-            val key = fragmentId.joinToString("") { "%02x".format(it) }
+            val key = "%016x:%s".format(senderId, fragmentId.joinToString("") { "%02x".format(it) })
 
             val transfer = pending.getOrPut(key) {
                 if (pending.size >= maxTransfers) {

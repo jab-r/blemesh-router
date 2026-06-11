@@ -107,13 +107,18 @@ enum class MessageType(val value: Byte) {
          * Worth holding for store-and-forward replay while a known local peer
          * is briefly off-air. ANNOUNCE / FRAGMENT / sync traffic is excluded:
          * heartbeats regenerate on the next interval and fragments carry
-         * their own re-assembly state.
+         * their own re-assembly state. NOISE_HANDSHAKE / NOISE_ENCRYPTED are
+         * excluded too: both apps treat an incoming handshake m1 on an
+         * established session as "peer restarted" and tear the session down,
+         * so a stale m1 replayed minutes later churns a session the phones
+         * already re-established over another path (and a replayed 0x12 is
+         * useless after any session reset anyway).
          * Unknown codes: NOT eligible — only buffer types whose replay
          * semantics we understand.
          */
         private val SNF_ELIGIBLE = bytes(
             MESSAGE, DELIVERY_ACK, DELIVERY_STATUS_REQUEST, READ_RECEIPT,
-            NOISE_HANDSHAKE, NOISE_ENCRYPTED, NOISE_IDENTITY_ANNOUNCE,
+            NOISE_IDENTITY_ANNOUNCE,
             LOXATION_ANNOUNCE, LOXATION_QUERY, LOXATION_CHUNK, LOXATION_COMPLETE,
             LOCATION_UPDATE, MLS_MESSAGE,
         )
@@ -130,7 +135,7 @@ enum class MessageType(val value: Byte) {
          * Unknown codes: NOT stored — the gossip stores are an include-list
          * by construction, and a push at least reaches open sync windows.
          */
-        private val GOSSIP_STORED = bytes(ANNOUNCE, MESSAGE, FRAGMENT, LOXATION_ANNOUNCE)
+        private val GOSSIP_STORED = bytes(ANNOUNCE, MESSAGE, FRAGMENT, LOXATION_ANNOUNCE, LOCATION_UPDATE)
         fun isGossipStored(type: Byte): Boolean = type in GOSSIP_STORED
 
         /**

@@ -1,5 +1,6 @@
 package com.blemesh.router.protocol
 
+import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.util.zip.Deflater
 import java.util.zip.Inflater
@@ -9,7 +10,12 @@ import java.util.zip.Inflater
  * Compression is only applied when payload > 100 bytes and entropy < 90%.
  */
 object CompressionUtil {
+    private const val TAG = "CompressionUtil"
     private const val COMPRESSION_THRESHOLD = 100
+
+    // Safety bound when no size hint is available (or a hostile packet claims
+    // expectedSize=0): no legitimate BLE-mesh payload approaches this.
+    private const val MAX_DECOMPRESSED_BYTES = 1L shl 20 // 1 MiB
 
     fun shouldCompress(data: ByteArray): Boolean {
         if (data.size < COMPRESSION_THRESHOLD) return false
@@ -55,11 +61,21 @@ object CompressionUtil {
                 inflater.setInput(data)
                 val output = ByteArrayOutputStream(if (expectedSize > 0) expectedSize else data.size * 2)
                 val buffer = ByteArray(1024)
+                val maxOutput = if (expectedSize > 0) expectedSize.toLong() * 4 else MAX_DECOMPRESSED_BYTES
                 while (!inflater.finished()) {
                     val count = inflater.inflate(buffer)
                     if (count <= 0) break
                     output.write(buffer, 0, count)
-                    if (expectedSize > 0 && output.size() > expectedSize * 4) break
+                    if (output.size() > maxOutput) {
+                        Log.w(TAG, "inflate(nowrap=$nowrap) exceeded bound expected=$expectedSize actual=${output.size()}")
+                        return null
+                    }
+                }
+                if (!inflater.finished()) {
+                    // Truncated/corrupt stream: the loop ended before the final
+                    // block. Partial plaintext must fail here, not get re-encoded,
+                    // relayed, and gossip-stored downstream as a "valid" packet.
+                    return null
                 }
                 val result = output.toByteArray()
                 if (result.isEmpty()) null else result

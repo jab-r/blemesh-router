@@ -13,7 +13,6 @@ import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.protocol.BlemeshProtocol
 import com.blemesh.router.router.LocalIdentity
 import com.blemesh.router.sync.GossipSyncManager
-import com.blemesh.router.sync.RequestSyncManager
 import com.blemesh.router.sync.RequestSyncPacket
 import com.blemesh.router.util.MessageDeduplicator
 import kotlinx.coroutines.*
@@ -167,11 +166,9 @@ class BleMeshService(
     private var isRunning = false
 
     // Gossip sync
-    private val requestSyncManager = RequestSyncManager()
     val gossipSyncManager = GossipSyncManager(
         myPeerID = myPeerID,
-        scope = scope,
-        requestSyncManager = requestSyncManager
+        scope = scope
     )
 
     data class PeerConnection(
@@ -471,10 +468,9 @@ class BleMeshService(
         // airtime that reads as an attack in phone logs. Store them instead;
         // they are replayed on each phone's next registered REQUEST_SYNC to
         // us, which passes the gate. Both phone teams have signed off on
-        // store-and-serve as the sole delivery path for these. Syncable
-        // types we do not store (e.g. LOCATION_UPDATE) fall through to the
-        // broadcast: a push that may land inside an open sync window beats
-        // certain loss.
+        // store-and-serve as the sole delivery path for these. A syncable
+        // type missing from GOSSIP_STORED falls through to the broadcast:
+        // a push that may land inside an open sync window beats certain loss.
         if ((packet.ttl.toInt() and 0xFF) == 0 &&
             packet.isBroadcast &&
             MessageType.isGossipStored(packet.type)
@@ -942,7 +938,7 @@ class BleMeshService(
         // Track fragment in gossip for sync
         gossipSyncManager.onPublicPacketSeen(packet)
 
-        val reassembled = reassemblyBuffer.addFragment(fragmentId, index, total, originalType, fragmentData)
+        val reassembled = reassemblyBuffer.addFragment(packet.senderId, fragmentId, index, total, originalType, fragmentData)
         if (reassembled != null) {
             val innerPacket = BinaryProtocol.decode(reassembled)
             if (innerPacket != null) {
@@ -1263,10 +1259,6 @@ class BleMeshService(
     // --- Gossip Delegate ---
 
     private val gossipDelegate = object : GossipSyncManager.Delegate {
-        override fun sendPacket(packet: BlemeshPacket) {
-            broadcastPacket(packet)
-        }
-
         override fun sendPacketToPeer(peerID: PeerID, packet: BlemeshPacket) {
             this@BleMeshService.sendPacketToPeer(peerID, packet)
         }

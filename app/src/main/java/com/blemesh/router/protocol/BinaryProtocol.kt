@@ -184,7 +184,13 @@ object BinaryProtocol {
             if (originalSize <= 0) return null
 
             val decompressed = CompressionUtil.decompress(compressedPayload, originalSize)
-            decompressed ?: return null
+                ?: return null
+            // A complete inflate that doesn't match the declared size is
+            // corruption; the router re-encodes and relays/bridges what it
+            // decodes, so a lenient accept here launders the corrupt payload
+            // into gossip stores and onto phones (iOS drops it the same way).
+            if (decompressed.size != originalSize) return null
+            decompressed
         } else {
             if (effectivePayloadLength < 0 || offset + effectivePayloadLength > data.size) return null
             val payloadBytes = data.copyOfRange(offset, offset + effectivePayloadLength)

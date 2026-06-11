@@ -17,14 +17,14 @@ Severity scale:
 
 Since the April 2026 audit, the router has shipped 9 commits (`1297218` … `2a1f701`) that close every P0 and P1 finding. Wire format, GATT plumbing, MTU-aware fragmentation, the WiFi bridge's routable-types whitelist, and TCP keepalive on bridge sockets are all correct. New transports (Wi-Fi Aware in `c20ea66`, Wi-Fi Direct, mDNS LAN discovery in `d31283c`) and the field-test fixes for stale BLE address mappings and Pixel NAN/P2P interface contention (`b96f085`) are correctly implemented.
 
-**The router is interop-correct against loxation-android and loxation-sw on all paths verified.** Initial findings were limited to one P2 robustness issue (fragment-dedup key asymmetry on the WiFi-to-BLE injection path) and two P3 notes; the P2 and one P3 have since been fixed in this commit. The remaining P3 (`isValidResponse` is dead code) is parity with the reference and is left alone pending a paired change in `loxation-android`.
+**The router is interop-correct against loxation-android and loxation-sw on all paths verified.** Initial findings were limited to one P2 robustness issue (fragment-dedup key asymmetry on the WiFi-to-BLE injection path) and two P3 notes; the P2 and one P3 have since been fixed in this commit. The last P3 (`isValidResponse` dead code) was resolved in June 2026: both apps landed their link-peer-keyed RSR flood gates, the router deliberately does NOT gate (collected ttl=0 replays are its cross-segment backfill input by design), and the dead `RequestSyncManager` was deleted so a signature that had drifted from the apps' can't be mis-wired later.
 
 | Severity | Count this audit (initial) | Remaining after §4 fixes | Count prior audit |
 |---|---|---|---|
 | P0 | **0** | **0** | 4 |
 | P1 | **0** | **0** | 4 |
 | P2 | 1 | **0** | 5 |
-| P3 | 2 | **1** | 4 |
+| P3 | 2 | **0** (last one resolved June 2026, see §4.3) | 4 |
 
 ---
 
@@ -39,8 +39,8 @@ Since the April 2026 audit, the router has shipped 9 commits (`1297218` … `2a1
 | 4.1 | P1 | `ROUTABLE_TYPES` whitelist dropped LEAVE, NOISE_IDENTITY_ANNOUNCE, DELIVERY_STATUS_REQUEST, LOXATION_QUERY/CHUNK/COMPLETE | **FIXED** | `router/MeshRouterService.kt:57–75` — all five missing types are now present |
 | 4.2 | P1 | Bridge had a 45-second stale-connection reaper but no keepalive | **FIXED** | `transport/WifiBridgeTransport.kt:112` (outbound) and `:159` (inbound) set `socket.keepAlive = true` |
 | 4.3 | P1 | No loop tag — dedup-only loop avoidance | **STILL PRESENT, accepted** | `router/MeshRouterService.kt:269–287` — for the current 2–3 router deployment scope this is fine; revisit if topology grows |
-| 4.4 | P1 | Bridge does not refresh TTL when crossing transports | **STILL PRESENT, intentional** | `router/MeshRouterService.kt:277` injects with the BLE-decremented TTL preserved. This is a deliberate design decision (single logical mesh across the bridge) and matches the CLAUDE.md framing |
-| 5.1 | P2 | `RequestSyncManager.isValidResponse()` is defined but never called | **STILL PRESENT, parity with reference** | Verified absent from both `sync/GossipSyncManager.kt` and `loxation-android/.../GossipSyncManager.kt`; no regression |
+| 4.4 | P1 | Bridge does not refresh TTL when crossing transports | **SUPERSEDED (e1ea500)** | The bridge now *spends* one TTL unit per crossing (floor 0) and clamps inbound packets arriving at MAX_TTL to MAX_TTL−1, so a hop through the router can't masquerade as a direct connection — `router/MeshRouterService.kt:265–277` (outbound), `:391–398` (inbound clamp). Still a single logical mesh: no refresh at the boundary |
+| 5.1 | P2 | `RequestSyncManager.isValidResponse()` is defined but never called | **RESOLVED (June 2026)** | Both apps landed their RSR flood gates; the router deliberately does not gate (see §4.3) and `RequestSyncManager` has been deleted outright |
 | 5.2 | P2 | `handleFragment` dedup-key asymmetry (1-byte vs 2-byte index) | **FIXED** | `mesh/BleMeshService.kt:484–485` (parse) and `:545` (dedup) both use 2-byte big-endian |
 | 5.3 | P2 | Jitter source not uniform (`abs(nanoTime) % range`) | **STILL PRESENT, parity** | `protocol/BlemeshProtocol.kt`; bias is negligible at 150 ms range |
 | 5.4 | P2 | `injectPacketFromWifi` uses a 3-part dedup key while BLE inbound uses a 5-part key for FRAGMENT | **STILL PRESENT** — see §4.1 below |
@@ -90,7 +90,7 @@ The following were re-checked against the reference and the spec; all are byte-f
 - Service / characteristic UUIDs match `BLE_UUIDS.md`: `F47B5E2D-…` / `A1B2C3D4-…`.
 
 ### WiFi bridge
-- Single global `bridgeDeduplicator` (`maxAge = 60_000 ms`, `maxEntries = 2000`) used across TCP, Aware, and Direct — `router/MeshRouterService.kt:86–89`.
+- Single global `bridgeDeduplicator` (`maxAge = 5 min`, `maxEntries = 5000`, matching the references' 5-minute dedup window) used across TCP, Aware, and Direct — `router/MeshRouterService.kt:68–73`.
 - Bridge dedup keys distinguish direction: `"ble2br-…"` (`:224`) and `"br2ble-…"` (`:274`) so the BLE→bridge and bridge→BLE paths never alias.
 - `routeBlePacketToBridge` skips `REQUEST_SYNC` with `ttl=0` (local-only) at `:222`.
 - `routeBlePacketToBridge` skips bridging when the recipient is already known-local at `:234–236`.
@@ -125,9 +125,9 @@ The following were re-checked against the reference and the spec; all are byte-f
 
 **Fix applied.** The recursive retry has been replaced with an internal `while (isRunning)` loop using exponential backoff: starts at 5 s (`INITIAL_RECONNECT_DELAY_MS`), doubles after each failure, caps at 5 min (`MAX_RECONNECT_DELAY_MS`), and exits the loop on a successful `registerConnection`. Verified at `transport/WifiBridgeTransport.kt:40–42, 104–138`.
 
-### 4.3 P3 — `RequestSyncManager.isValidResponse()` is defined but never called — left as-is
+### 4.3 P3 — `RequestSyncManager.isValidResponse()` is defined but never called — **RESOLVED (June 2026): deleted; not gating is now a deliberate divergence**
 
-This is parity with `loxation-android`, not a router-specific regression. Either delete the dead helper in both codebases, or wire it into `GossipSyncManager.handleRequestSyncInternal` to gate response generation. As it stands, an unauthenticated peer can ask the router to enumerate and filter its packet store by sending unsolicited `REQUEST_SYNC` traffic. Practical exposure is small because the response itself is gossip data and contains no secrets, but it's a free-CPU vector. **Left as-is pending a paired change in `loxation-android`** so both codebases stay aligned.
+The original rationale ("parity with loxation-android, pending a paired change") no longer holds: both apps have since wired link-peer-keyed RSR flood gates (Android `BLEMeshService.kt:765`, iOS `BLEMeshService.swift:2108`). The router intentionally does **not** follow them — it is a bridge, and the ttl=0 gossip replays it collects from local phones are its only cross-segment backfill input (`router/MeshRouterService.kt:265–277`); a gate would drop exactly that traffic, while buying ~nothing (the router ingests all fresh public packets at any TTL by design; its defenses are dedup, freshness windows, and capacity-bounded stores). `RequestSyncManager` was deleted outright rather than left dormant: its `isValidResponse(from)` signature had drifted from the apps' `isValidResponse(from, isRSR)`, so keeping it invited a future mis-wire with wrong semantics. The residual note stands: an unauthenticated peer can still make the router enumerate its packet store with unsolicited `REQUEST_SYNC` — accepted, since responses are gossip data with no secrets and the per-request cost is small.
 
 ---
 
@@ -136,7 +136,7 @@ This is parity with `loxation-android`, not a router-specific regression. Either
 These are listed for completeness; none are recommended to act on right now.
 
 - **Bridge loop avoidance** (`router/MeshRouterService.kt:269–287`). Still relies entirely on `bridgeDeduplicator` to terminate A–B–C–A cycles. Acceptable for ≤ 3-router deployments. If the bridge topology grows to 4+ routers, add a `routers visited` TLV (or per-packet bridge-only envelope) and check it on ingress.
-- **TTL preservation across the bridge** (`:277`). Intentional — packets carry their BLE-decremented TTL into the next BLE segment. This caps the practical reach of a multi-segment mesh (a packet that took 2 BLE hops before bridging has only 5 TTL left on the far side). If the goal becomes "router resets the segment counter," add a deliberate refresh at the bridge boundary plus a guard against infinite amplification (e.g. only refresh once per bridge hop and track that in the same routers-visited TLV from the prior bullet).
+- **TTL across the bridge** (`router/MeshRouterService.kt:265–277`). Since `e1ea500` the bridge *spends* one TTL unit per crossing (floor 0) and clamps inbound MAX_TTL arrivals to MAX_TTL−1 (`:391–398`) so a hop through the router can't masquerade as a direct connection. Still no refresh at the boundary, which caps the practical reach of a multi-segment mesh. If the goal becomes "router resets the segment counter," add a deliberate refresh at the bridge boundary plus a guard against infinite amplification (e.g. only refresh once per bridge hop and track that in the same routers-visited TLV from the prior bullet).
 - **Wi-Fi Direct transport** is shipped but only activates when Wi-Fi Aware is unavailable. Its on-device test coverage is therefore thin. If you intend to support pre-Aware devices in production, plan a dedicated field test for the Direct path.
 
 ---
@@ -145,7 +145,7 @@ These are listed for completeness; none are recommended to act on right now.
 
 1. ~~Fix §4.1~~ — done in this commit.
 2. ~~Fix §4.2~~ — done in this commit.
-3. **Decide on §4.3** (delete `isValidResponse` or wire it in). ~5 lines either way; coordinate with loxation-android since it's the same code.
+3. ~~Decide on §4.3~~ — resolved June 2026: `RequestSyncManager` deleted; the router deliberately does not gate RSRs (see §4.3).
 4. **Field test Wi-Fi Direct** if pre-Aware (Pixel-and-friends only) deployments are in scope.
 
 Everything else listed in §2 / §5 is accepted-as-is for this release.

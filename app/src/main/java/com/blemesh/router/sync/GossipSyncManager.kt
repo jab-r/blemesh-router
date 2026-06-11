@@ -14,7 +14,6 @@ import java.util.concurrent.ConcurrentHashMap
 class GossipSyncManager(
     private val myPeerID: PeerID,
     private val scope: CoroutineScope,
-    private val requestSyncManager: RequestSyncManager,
     private val config: Config = Config()
 ) {
     companion object {
@@ -22,7 +21,6 @@ class GossipSyncManager(
     }
 
     interface Delegate {
-        fun sendPacket(packet: BlemeshPacket)
         fun sendPacketToPeer(peerID: PeerID, packet: BlemeshPacket)
         fun getConnectedPeers(): List<PeerID>
     }
@@ -37,8 +35,10 @@ class GossipSyncManager(
         val stalePeerTimeoutSeconds: Long = 60,
         val fragmentCapacity: Int = 600,
         val loxationCapacity: Int = 200,
+        val locationUpdateCapacity: Int = 100, // indoor position update packets (short-lived)
         val fragmentSyncIntervalSeconds: Long = 30,
         val loxationSyncIntervalSeconds: Long = 60,
+        val locationUpdateSyncIntervalSeconds: Long = 15, // frequent for real-time positioning
         val messageSyncIntervalSeconds: Long = 15,
         val maxPeersPerSync: Int = 2,
         val syncJitterRatio: Double = 0.3
@@ -103,6 +103,7 @@ class GossipSyncManager(
     private val messages = PacketStore()
     private val fragments = PacketStore()
     private val loxationPackets = PacketStore()
+    private val locationUpdatePackets = PacketStore()
     private val latestAnnouncementByPeer = ConcurrentHashMap<PeerID, Pair<String, BlemeshPacket>>()
 
     private var periodicJob: Job? = null
@@ -118,6 +119,9 @@ class GossipSyncManager(
         }
         if (config.loxationCapacity > 0 && config.loxationSyncIntervalSeconds > 0) {
             syncSchedules.add(SyncSchedule(SyncTypeFlags.LOXATION_ANNOUNCE, config.loxationSyncIntervalSeconds * 1000))
+        }
+        if (config.locationUpdateCapacity > 0 && config.locationUpdateSyncIntervalSeconds > 0) {
+            syncSchedules.add(SyncSchedule(SyncTypeFlags.LOCATION_UPDATE, config.locationUpdateSyncIntervalSeconds * 1000))
         }
     }
 
@@ -151,6 +155,10 @@ class GossipSyncManager(
             if (config.loxationCapacity > 0 && config.loxationSyncIntervalSeconds > 0) {
                 delay(500)
                 sendRequestSync(peerID, types = SyncTypeFlags.LOXATION_ANNOUNCE)
+            }
+            if (config.locationUpdateCapacity > 0 && config.locationUpdateSyncIntervalSeconds > 0) {
+                delay(500)
+                sendRequestSync(peerID, types = SyncTypeFlags.LOCATION_UPDATE)
             }
         }
     }
@@ -221,6 +229,11 @@ class GossipSyncManager(
                 val idHex = PacketIdUtil.computeIdHex(packet)
                 loxationPackets.insert(idHex, packet, config.loxationCapacity.coerceAtLeast(1))
             }
+            MessageType.LOCATION_UPDATE -> {
+                if (!isBroadcast || !isPacketFresh(packet)) return
+                val idHex = PacketIdUtil.computeIdHex(packet)
+                locationUpdatePackets.insert(idHex, packet, config.locationUpdateCapacity.coerceAtLeast(1))
+            }
             else -> { /* ignore */ }
         }
     }
@@ -236,29 +249,19 @@ class GossipSyncManager(
             for (peerID in peersToSync) {
                 sendRequestSync(peerID, types = types)
             }
-        } else {
-            sendRequestSyncBroadcast(types)
         }
-    }
-
-    private fun sendRequestSyncBroadcast(types: SyncTypeFlags) {
-        val payload = buildGcsPayload(types)
-        val pkt = BlemeshPacket(
-            version = BlemeshPacket.PROTOCOL_VERSION,
-            type = MessageType.REQUEST_SYNC.value,
-            ttl = 0,
-            timestamp = System.currentTimeMillis(),
-            flags = 0,
-            senderId = myPeerID.toLongBE(),
-            recipientId = BlemeshPacket.BROADCAST_ADDRESS,
-            payload = payload,
-            signature = null
-        )
-        delegate?.sendPacket(pkt)
+        // No broadcast fallback when no peers are mapped: both reference apps
+        // deleted it (their RSR flood gates are keyed per-PeerID, so responses
+        // to a broadcast were dropped as unsolicited), and for the router it
+        // was nearly dead code — it fired only with zero announce-mapped
+        // peers, i.e. nobody we could address — while inviting phones that
+        // lack our address mapping to broadcast their ttl=0 RSR burst, which
+        // other phones drop with gossip.security warnings. First-contact
+        // reconciliation is covered by scheduleInitialSyncToPeer (unicast ~5s
+        // after a peer's announce). Do NOT re-add a broadcast REQUEST_SYNC.
     }
 
     private fun sendRequestSync(peerID: PeerID, types: SyncTypeFlags) {
-        requestSyncManager.registerRequest(peerID)
         val payload = buildGcsPayload(types)
         val pkt = BlemeshPacket(
             version = BlemeshPacket.PROTOCOL_VERSION,
@@ -327,6 +330,16 @@ class GossipSyncManager(
             }
         }
 
+        if (requestedTypes.contains(MessageType.LOCATION_UPDATE)) {
+            for (pkt in locationUpdatePackets.allPackets(::isPacketFresh)) {
+                val idBytes = PacketIdUtil.computeIdBytes(pkt)
+                if (!mightContain(idBytes)) {
+                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
+                    sentCount++
+                }
+            }
+        }
+
         if (sentCount > 0) {
             Log.d(TAG, "Sent $sentCount packets to ${fromPeerID.rawValue.take(8)} in response to REQUEST_SYNC")
         }
@@ -348,6 +361,9 @@ class GossipSyncManager(
         if (types.contains(MessageType.LOXATION_ANNOUNCE)) {
             candidates.addAll(loxationPackets.allPackets(::isPacketFresh))
         }
+        if (types.contains(MessageType.LOCATION_UPDATE)) {
+            candidates.addAll(locationUpdatePackets.allPackets(::isPacketFresh))
+        }
 
         if (candidates.isEmpty()) {
             val p = GCSFilter.deriveP(config.gcsTargetFpr)
@@ -361,6 +377,7 @@ class GossipSyncManager(
         val cap = when {
             types == SyncTypeFlags.FRAGMENT -> config.fragmentCapacity.coerceAtLeast(1)
             types == SyncTypeFlags.LOXATION_ANNOUNCE -> config.loxationCapacity.coerceAtLeast(1)
+            types == SyncTypeFlags.LOCATION_UPDATE -> config.locationUpdateCapacity.coerceAtLeast(1)
             else -> config.seenCapacity.coerceAtLeast(1)
         }
         val takeN = minOf(candidates.size, nMax, cap)
@@ -377,7 +394,6 @@ class GossipSyncManager(
     private fun performPeriodicMaintenance() {
         cleanupExpiredMessages()
         cleanupStaleAnnouncementsIfNeeded()
-        requestSyncManager.cleanup()
 
         val now = System.currentTimeMillis()
         for (i in syncSchedules.indices) {
@@ -397,6 +413,7 @@ class GossipSyncManager(
         messages.removeExpired(::isPacketFresh)
         fragments.removeExpired(::isPacketFresh)
         loxationPackets.removeExpired(::isPacketFresh)
+        locationUpdatePackets.removeExpired(::isPacketFresh)
     }
 
     private fun cleanupStaleAnnouncementsIfNeeded() {
@@ -420,6 +437,7 @@ class GossipSyncManager(
         messages.remove { it.senderId == senderLong }
         fragments.remove { it.senderId == senderLong }
         loxationPackets.remove { it.senderId == senderLong }
+        locationUpdatePackets.remove { it.senderId == senderLong }
     }
 
     private fun hexToBytes(hex: String): ByteArray {
