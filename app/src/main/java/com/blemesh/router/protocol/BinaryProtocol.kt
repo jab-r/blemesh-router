@@ -57,7 +57,10 @@ object BinaryProtocol {
             output.write(1) // version
             output.write(packet.type.toInt() and 0xFF)
             output.write(packet.ttl.toInt() and 0xFF)
-            output.write(ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(packet.timestamp).array())
+            // wireTimestamp, not timestamp: re-encoding a relayed packet must
+            // write the original wire bytes, or each hop rewrites the field
+            // with its receiver-local normalization and IDs diverge downstream.
+            output.write(ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(packet.wireTimestamp).array())
             output.write(flags and 0xFF)
             output.write((payloadLength shr 8) and 0xFF)
             output.write(payloadLength and 0xFF)
@@ -218,7 +221,8 @@ object BinaryProtocol {
             senderId = senderId,
             recipientId = recipientId,
             payload = payload,
-            signature = signature
+            signature = signature,
+            rawWireTimestamp = rawTimestamp
         )
     }
 

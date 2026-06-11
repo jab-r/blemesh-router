@@ -1029,12 +1029,15 @@ class BleMeshService(
     }
 
     private fun buildDeduplicationKey(packet: BlemeshPacket): String {
+        // wireTimestamp: the receiver-local skew clamp yields a different
+        // normalized value on every receive of the same bytes, so keying on
+        // it lets byte-identical replays of a clock-skewed packet pass dedup.
         return if (packet.type == MessageType.FRAGMENT.value && packet.payload.size >= 13) {
             val fragmentID = packet.payload.take(8).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
             val index = ((packet.payload[8].toInt() and 0xFF) shl 8) or (packet.payload[9].toInt() and 0xFF)
-            "${packet.senderId}-${packet.timestamp}-${packet.type}-$fragmentID-$index"
+            "${packet.senderId}-${packet.wireTimestamp}-${packet.type}-$fragmentID-$index"
         } else {
-            "${packet.senderId}-${packet.timestamp}-${packet.type}"
+            "${packet.senderId}-${packet.wireTimestamp}-${packet.type}"
         }
     }
 
@@ -1116,7 +1119,11 @@ class BleMeshService(
                     senderId = packet.senderId,
                     recipientId = packet.recipientId,
                     payload = payload,
-                    signature = null
+                    signature = null,
+                    // Fragments of a relayed packet carry the ORIGINAL's wire
+                    // timestamp so every node derives the same fragment dedup
+                    // keys even when the original came from a skewed clock.
+                    rawWireTimestamp = packet.rawWireTimestamp
                 )
                 val fragmentEncoded = BinaryProtocol.encode(fragmentPacket) ?: continue
                 writeToConnection(connection, fragmentEncoded)

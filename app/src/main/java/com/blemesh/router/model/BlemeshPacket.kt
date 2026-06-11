@@ -17,7 +17,16 @@ data class BlemeshPacket(
     val senderId: Long,
     val recipientId: Long,
     val payload: ByteArray,
-    val signature: ByteArray?
+    val signature: ByteArray?,
+    // Raw 8-byte timestamp as received, pre-normalization; null for locally
+    // constructed packets. Normalization (µs/sec rescale, epoch shift, skew
+    // clamp) is receiver-LOCAL, so anything that must agree across nodes or
+    // round-trip the wire byte-faithfully — packet IDs, dedup keys, re-encode
+    // on relay/bridge — must use [wireTimestamp], never [timestamp].
+    // [timestamp] (normalized) is for freshness checks and display only.
+    // Lockstep change across all three platforms, June 2026
+    // (../loxation-android/TIMESTAMP_LOCKSTEP_FIX.md).
+    val rawWireTimestamp: Long? = null
 ) {
     companion object {
         const val PROTOCOL_VERSION = 1
@@ -28,6 +37,10 @@ data class BlemeshPacket(
         const val FLAG_HAS_SIGNATURE = 0x02
         const val FLAG_IS_COMPRESSED = 0x04
     }
+
+    /** Timestamp to put on the wire / hash / dedup on: raw as received, or [timestamp] for local packets. */
+    val wireTimestamp: Long
+        get() = rawWireTimestamp ?: timestamp
 
     /** True if this packet is addressed to a specific recipient (not broadcast). */
     val isDirected: Boolean
@@ -45,6 +58,12 @@ data class BlemeshPacket(
         if (isBroadcast) return null
         return PeerID.fromLongBE(recipientId)
     }
+
+    // These MUST stay data-class copy(): a hand-rolled field-by-field rebuild
+    // silently drops newly added fields (loxation-android had exactly this bug
+    // with a shadowing copy(ttl) helper losing rawWireTimestamp on RSR
+    // responses). Anything cloning a packet by constructor must enumerate
+    // EVERY field — see the fragment-wrapper rebuild in BleMeshService.
 
     /** Create a copy with decremented TTL for relaying. */
     fun withDecrementedTTL(): BlemeshPacket = copy(ttl = ((ttl.toInt() and 0xFF) - 1).toByte())

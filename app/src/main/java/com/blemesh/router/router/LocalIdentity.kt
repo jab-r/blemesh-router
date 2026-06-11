@@ -43,14 +43,18 @@ object LocalIdentity {
         val nickname: String = "router-${peerID.rawValue.take(8)}"
 
         /**
-         * 64-byte Ed25519 signature over senderID(8 BE) + timestamp(8 BE) +
-         * payload — the signed-packet format both references verify.
+         * 64-byte Ed25519 signature over senderID(8 BE) + wireTimestamp(8 BE) +
+         * payload — the signed-packet format both references verify. The
+         * signature must cover the bytes that go on the wire, never a
+         * receiver-normalized timestamp (identity for our own packets, but
+         * this site must stay normalization-free per the June 2026 lockstep
+         * fix).
          */
         fun signPacket(packet: BlemeshPacket): ByteArray {
             val input = ByteBuffer.allocate(8 + 8 + packet.payload.size)
                 .order(ByteOrder.BIG_ENDIAN)
                 .putLong(packet.senderId)
-                .putLong(packet.timestamp)
+                .putLong(packet.wireTimestamp)
                 .put(packet.payload)
                 .array()
             val signer = Ed25519Signer()

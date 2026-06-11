@@ -232,7 +232,7 @@ class MeshRouterService : Service() {
     private fun routeBlePacketToBridge(packet: BlemeshPacket) {
         if (!MessageType.isBridgeable(packet.type)) return
 
-        val dedupKey = "ble2br-${packet.senderId}-${packet.timestamp}-${packet.type}"
+        val dedupKey = "ble2br-${packet.senderId}-${packet.wireTimestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
         val tag = packetTag(packet)
@@ -378,7 +378,7 @@ class MeshRouterService : Service() {
         // or be multi-hopped onward.
         if (!MessageType.isBridgeable(packet.type)) return
 
-        val dedupKey = "br2ble-${packet.senderId}-${packet.timestamp}-${packet.type}"
+        val dedupKey = "br2ble-${packet.senderId}-${packet.wireTimestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
 
         // Packets addressed to this router terminate here (mirror of the

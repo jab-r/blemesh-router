@@ -5,9 +5,12 @@ import java.security.MessageDigest
 
 /**
  * Deterministic packet ID computation for gossip sync membership.
- * ID = first 16 bytes of SHA-256 over: [type | senderID(8 bytes BE) | timestamp(8 bytes BE) | payload]
+ * ID = first 16 bytes of SHA-256 over: [type | senderID(8 bytes BE) | wireTimestamp(8 bytes BE) | payload]
  *
  * Must match iOS PacketIdUtil.computeId() exactly for cross-platform GCS interop.
+ * wireTimestamp, not the normalized timestamp: normalization is receiver-local
+ * (the skew clamp uses each node's own clock), so hashing it gives a clock-skewed
+ * packet a different GCS id on every node and it can never reconcile in sync.
  */
 object PacketIdUtil {
 
@@ -18,7 +21,7 @@ object PacketIdUtil {
         for (i in 7 downTo 0) {
             md.update(((sid ushr (i * 8)) and 0xFF).toByte())
         }
-        val ts = packet.timestamp
+        val ts = packet.wireTimestamp
         for (i in 7 downTo 0) {
             md.update(((ts ushr (i * 8)) and 0xFF).toByte())
         }
