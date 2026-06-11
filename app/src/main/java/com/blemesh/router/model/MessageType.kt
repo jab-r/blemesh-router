@@ -120,6 +120,20 @@ enum class MessageType(val value: Byte) {
         fun isStoreAndForwardEligible(type: Byte): Boolean = type in SNF_ELIGIBLE
 
         /**
+         * Types the router's gossip stores hold and can replay to a peer's
+         * REQUEST_SYNC (mirrors GossipSyncManager.onPublicPacketSeen). Used
+         * to pick store-and-serve over BLE broadcast for bridged ttl=0
+         * gossip replays: reference phones (iOS now, Android Batch3-E) drop
+         * unsolicited syncable packets at ttl == 0, so a spontaneous push
+         * is dead airtime, while a stored copy is delivered on the phone's
+         * next registered sync — which passes its gate.
+         * Unknown codes: NOT stored — the gossip stores are an include-list
+         * by construction, and a push at least reaches open sync windows.
+         */
+        private val GOSSIP_STORED = bytes(ANNOUNCE, MESSAGE, FRAGMENT, LOXATION_ANNOUNCE)
+        fun isGossipStored(type: Byte): Boolean = type in GOSSIP_STORED
+
+        /**
          * Counted by the retry-storm diagnostic. ANNOUNCE is a periodic
          * heartbeat (very chatty); FRAGMENT de-duplicates via its fragment
          * ID. Storms on NOISE_HANDSHAKE / NOISE_ENCRYPTED / MESSAGE /

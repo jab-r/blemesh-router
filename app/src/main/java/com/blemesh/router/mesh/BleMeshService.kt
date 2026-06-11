@@ -463,6 +463,27 @@ class BleMeshService(
         if (deduplicator.isDuplicate(buildDeduplicationKey(packet))) return
 
         val type = "0x%02x".format(packet.type.toInt() and 0xFF)
+
+        // Gossip replays cross the bridge at ttl=0 (the only cross-segment
+        // backfill path — see routeBlePacketToBridge). Reference phones gate
+        // syncable DATA packets at ttl == 0: unsolicited ones are dropped
+        // with a gossip.security warning, so pushing these over BLE is dead
+        // airtime that reads as an attack in phone logs. Store them instead;
+        // they are replayed on each phone's next registered REQUEST_SYNC to
+        // us, which passes the gate. Both phone teams have signed off on
+        // store-and-serve as the sole delivery path for these. Syncable
+        // types we do not store (e.g. LOCATION_UPDATE) fall through to the
+        // broadcast: a push that may land inside an open sync window beats
+        // certain loss.
+        if ((packet.ttl.toInt() and 0xFF) == 0 &&
+            packet.isBroadcast &&
+            MessageType.isGossipStored(packet.type)
+        ) {
+            gossipSyncManager.onPublicPacketSeen(packet)
+            Log.d(TAG, "WiFi→BLE store-only type=$type (ttl=0 replay; served on next sync)")
+            return
+        }
+
         val targets = connectedPeers.keys.joinToString(",")
         Log.d(TAG, "WiFi→BLE inject type=$type → [${if (targets.isEmpty()) "no BLE peers" else targets}]")
 
