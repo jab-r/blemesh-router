@@ -5,6 +5,22 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
+ * Announce nodeType (TLV 0x08, NODETYPE_RELAY_ONLY_SPEC.md). Phones never
+ * emit the TLV — an absent TLV means MOBILE, so every pre-flag build decodes
+ * as MOBILE. Apps that honor the flag never initiate a Noise handshake
+ * toward a FIXED_RELAY (the router), ending the doomed-handshake retry loop.
+ */
+enum class NodeType(val value: Int) {
+    MOBILE(0x00),
+    FIXED_RELAY(0x01);
+
+    companion object {
+        /** Unknown values fail OPEN to MOBILE — worst case is today's harmless behavior. */
+        fun from(value: Int): NodeType = if (value == FIXED_RELAY.value) FIXED_RELAY else MOBILE
+    }
+}
+
+/**
  * Device announcement data for peer discovery.
  * TLV-encoded, matching iOS AnnouncementPacket for interop.
  *
@@ -16,6 +32,7 @@ import java.nio.ByteOrder
  *   0x05 locationId (UTF-8)
  *   0x06 uwbToken (UTF-8)
  *   0x07 timestamp (8 bytes big-endian)
+ *   0x08 nodeType (1 byte; absent = mobile — see [NodeType])
  */
 data class AnnouncementData(
     val nickname: String,
@@ -24,7 +41,8 @@ data class AnnouncementData(
     val deviceId: ByteArray? = null,
     val locationId: String? = null,
     val uwbToken: String? = null,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val nodeType: NodeType = NodeType.MOBILE
 ) {
     val isValid: Boolean
         get() = nickname.isNotBlank() &&
@@ -52,6 +70,12 @@ data class AnnouncementData(
         if (signingPublicKey.size != 32) return byteArrayOf()
         put(0x03, signingPublicKey)
 
+        // MOBILE omits the TLV (spec: absent means mobile), keeping phone-style
+        // announces byte-identical to pre-flag builds.
+        if (nodeType != NodeType.MOBILE) {
+            put(0x08, byteArrayOf(nodeType.value.toByte()))
+        }
+
         return baos.toByteArray()
     }
 
@@ -66,6 +90,7 @@ data class AnnouncementData(
                 var locationId: String? = null
                 var uwbToken: String? = null
                 var timestamp: Long? = null
+                var nodeType = NodeType.MOBILE
 
                 while (idx + 2 <= data.size) {
                     val tag = data[idx].toInt() and 0xFF
@@ -85,6 +110,9 @@ data class AnnouncementData(
                         0x07 -> if (value.size == 8) {
                             timestamp = ByteBuffer.wrap(value).order(ByteOrder.BIG_ENDIAN).long
                         }
+                        0x08 -> if (value.size == 1) {
+                            nodeType = NodeType.from(value[0].toInt() and 0xFF)
+                        }
                     }
                 }
 
@@ -100,7 +128,8 @@ data class AnnouncementData(
                     deviceId = deviceId,
                     locationId = locationId,
                     uwbToken = uwbToken,
-                    timestamp = timestamp ?: System.currentTimeMillis()
+                    timestamp = timestamp ?: System.currentTimeMillis(),
+                    nodeType = nodeType
                 ).takeIf { it.isValid }
             } catch (_: Exception) {
                 return null

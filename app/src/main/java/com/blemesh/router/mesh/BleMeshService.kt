@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
 import com.blemesh.router.model.AnnouncementData
+import com.blemesh.router.model.NodeType
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
@@ -59,6 +60,14 @@ class BleMeshService(
         private const val SCAN_RESTART_INTERVAL_MS = 30_000L
         private const val RSSI_POLL_INTERVAL_MS = 15_000L
         private const val ANNOUNCE_INTERVAL_MS = 30_000L
+
+        // Announce TLV 0x08 nodeType=fixedRelay (NODETYPE_RELAY_ONLY_SPEC.md):
+        // tells phones never to initiate Noise handshakes toward us, ending
+        // the doomed-handshake retry loop. Enabled June 2026 after both apps
+        // shipped the honor logic (the spec's rollout precondition). The flag
+        // is inert toward older phone builds — they just keep today's
+        // harmless retry behavior.
+        private const val EMIT_FIXED_RELAY_NODE_TYPE = true
 
         // GATT write serialization (mirrors loxation-android writeChunkedWWR):
         // Android fails a writeCharacteristic()/notify issued while one is
@@ -355,7 +364,8 @@ class BleMeshService(
         val payload = AnnouncementData(
             nickname = identity.nickname,
             noisePublicKey = identity.noisePublicKey,
-            signingPublicKey = identity.signingPublicKey
+            signingPublicKey = identity.signingPublicKey,
+            nodeType = if (EMIT_FIXED_RELAY_NODE_TYPE) NodeType.FIXED_RELAY else NodeType.MOBILE
         ).encode()
         if (payload.isEmpty()) return
 
