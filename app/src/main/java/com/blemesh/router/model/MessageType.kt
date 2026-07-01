@@ -62,12 +62,15 @@ enum class MessageType(val value: Byte) {
     ROUTER_CAPS(0x72),
     // Backbone GCS anti-entropy (router-to-router gossip). ROUTER_SYNC carries a
     // RequestSync TLV (the sender's GCS filter of crossable content it holds);
-    // ROUTER_SYNC_DATA carries one packet the peer was missing, framed with an
-    // optional origin-router claim (RouterSyncDataFrame) so a re-seeded announce
-    // can also rebuild the receiver's peer→home-router map for reliable DMs.
-    // Both are directed control frames, never injected into BLE.
+    // ROUTER_SYNC_DATA carries one BinaryProtocol-encoded packet the peer was
+    // missing (content reconciliation only).
     ROUTER_SYNC(0x73),
-    ROUTER_SYNC_DATA(0x74);
+    ROUTER_SYNC_DATA(0x74),
+    // Backbone home-router routing (RouterHomeFrame). A router advertises the
+    // peers currently in its own BLE region so peers learn peer→home-router
+    // routes directly — decoupled from content gossip so a content re-seed can't
+    // suppress route learning. Enables reliable directed DMs across 3+ routers.
+    ROUTER_HOME(0x75);
 
     companion object {
         fun from(value: Byte): MessageType? = entries.firstOrNull { it.value == value }
@@ -112,7 +115,8 @@ enum class MessageType(val value: Byte) {
          * signaling between reference peers.
          */
         private val NON_BRIDGEABLE = bytes(
-            UWB_RANGING, ROUTER_PING, ROUTER_PONG, ROUTER_CAPS, ROUTER_SYNC, ROUTER_SYNC_DATA
+            UWB_RANGING, ROUTER_PING, ROUTER_PONG, ROUTER_CAPS,
+            ROUTER_SYNC, ROUTER_SYNC_DATA, ROUTER_HOME
         )
         fun isBridgeable(type: Byte): Boolean = type !in NON_BRIDGEABLE
 

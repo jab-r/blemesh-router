@@ -20,4 +20,9 @@ class MessageTypeBackboneGossipTest {
     fun routerSyncData_isNotBridgeable() {
         assertFalse(MessageType.isBridgeable(MessageType.ROUTER_SYNC_DATA.value))
     }
+
+    @Test
+    fun routerHome_isNotBridgeable() {
+        assertFalse(MessageType.isBridgeable(MessageType.ROUTER_HOME.value))
+    }
 }
