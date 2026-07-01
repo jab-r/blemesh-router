@@ -737,15 +737,16 @@ class MeshRouterService : Service() {
         // that relayed the announce to us. Fall back to fromRouter for an
         // untagged/legacy frame. On a change (first sighting or a roam) re-route
         // any DMs we're holding for that peer.
+        //
+        // Evidence time is the announce's own (normalized) emission time, NOT
+        // receipt time: a late or reordered stale announce that crosses the
+        // backbone after a fresher one must not clobber the newer route. This
+        // shares learnHomeRoute's monotonic CAS with the ROUTER_HOME writer so
+        // the two writers of peerToHomeRouter agree on "more-recent-sighting-wins".
         if (packet.type == MessageType.ANNOUNCE.value || packet.type == MessageType.LOXATION_ANNOUNCE.value) {
             val originRouter = visited.firstOrNull() ?: fromRouter
             PeerID.fromLongBE(packet.senderId)?.let { sender ->
-                if (sender != myPeerID && sender != originRouter) {
-                    val prev = peerToHomeRouter.put(
-                        sender, RouterRoute(fromTransport, originRouter, System.currentTimeMillis())
-                    )
-                    if (prev == null || prev.routerPeerID != originRouter) flushDmQueue(sender)
-                }
+                learnHomeRoute(sender, originRouter, fromTransport, packet.timestamp)
             }
         }
 
@@ -971,30 +972,54 @@ class MeshRouterService : Service() {
         val now = System.currentTimeMillis()
         var learned = 0
         for (entry in entries) {
-            val peer = entry.peerID
-            if (peer == myPeerID || peer == fromRouter) continue
             val sightedMs = now - entry.ageSeconds * 1000L
-            var flushed = false
-            peerToHomeRouter.compute(peer) { _, prev ->
-                when {
-                    // No route, or the advertiser saw the peer more recently than
-                    // our current route's evidence → (re)bind to this router.
-                    prev == null || prev.routerPeerID != fromRouter ->
-                        if (prev == null || sightedMs > prev.lastSeenMs) {
-                            flushed = true
-                            RouterRoute(fromTransport, fromRouter, sightedMs)
-                        } else prev
-                    // Same router: refresh only forward in time.
-                    else ->
-                        if (sightedMs > prev.lastSeenMs) RouterRoute(fromTransport, fromRouter, sightedMs)
-                        else prev
-                }
-            }
-            if (flushed) { flushDmQueue(peer); learned++ }
+            if (learnHomeRoute(entry.peerID, fromRouter, fromTransport, sightedMs)) learned++
         }
         if (learned > 0) {
             Log.d(TAG, "ROUTER_HOME from ${fromRouter.rawValue.take(8)}: (re)bound $learned peer(s)")
         }
+    }
+
+    /**
+     * Bind [peer] to home router [router] (reachable via [transport]) under a
+     * single monotonic compare-and-swap keyed on [evidenceMs] — the local-clock
+     * time the peer was last known active behind that router (an announce's
+     * normalized emission time on the push path; now − advertised age on the
+     * ROUTER_HOME path). This is the SOLE writer discipline for peerToHomeRouter:
+     * both the ANNOUNCE push path and ROUTER_HOME route through it so neither can
+     * clobber the other with staler evidence.
+     *
+     * A route is (re)bound to a DIFFERENT router only when this evidence is
+     * fresher than the current route's, and refreshed for the SAME router only
+     * forward in time — so a late/reordered stale announce or a lagging advert
+     * can never overwrite a fresher route (the anti-flap invariant). The CAS is
+     * atomic (ConcurrentHashMap.compute); this runs on transport read threads.
+     * Returns true (and flushes held DMs) when the peer's home router changed.
+     */
+    private fun learnHomeRoute(
+        peer: PeerID,
+        router: PeerID,
+        transport: RouterTransport,
+        evidenceMs: Long
+    ): Boolean {
+        if (peer == myPeerID || peer == router) return false
+        var rebound = false
+        peerToHomeRouter.compute(peer) { _, prev ->
+            when {
+                // No route, or a different router with fresher evidence → (re)bind.
+                prev == null || prev.routerPeerID != router ->
+                    if (prev == null || evidenceMs > prev.lastSeenMs) {
+                        rebound = true
+                        RouterRoute(transport, router, evidenceMs)
+                    } else prev
+                // Same router: refresh only forward in time.
+                else ->
+                    if (evidenceMs > prev.lastSeenMs) RouterRoute(transport, router, evidenceMs)
+                    else prev
+            }
+        }
+        if (rebound) flushDmQueue(peer)
+        return rebound
     }
 
     // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---
