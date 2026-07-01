@@ -14,6 +14,7 @@ import android.util.Log
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
+import com.blemesh.router.transport.BackboneFrame
 import com.blemesh.router.transport.RouterTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -83,6 +84,8 @@ class WifiDirectTransport(
     }
 
     private val peers = ConcurrentHashMap<PeerID, PeerLink>()
+    // Peers that advertised backbone path-tag support (ROUTER_CAPS).
+    private val tagAwarePeers = ConcurrentHashMap.newKeySet<PeerID>()
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var serverAcceptJob: Job? = null
     @Volatile private var connectionInProgress: Boolean = false
@@ -118,18 +121,32 @@ class WifiDirectTransport(
         scope.cancel()
     }
 
-    override fun broadcast(packet: BlemeshPacket) {
-        val data = BinaryProtocol.encode(packet) ?: return
-        for (link in peers.values) writeFramed(link, data)
+    override fun broadcast(packet: BlemeshPacket, visited: List<PeerID>, taggedPeersOnly: Boolean) {
+        val plain = BinaryProtocol.encode(packet) ?: return
+        val tagged = if (visited.isNotEmpty()) BackboneFrame.encode(visited, plain) else plain
+        for ((peerID, link) in peers) {
+            if (peerID in visited) continue // split-horizon
+            val aware = peerID in tagAwarePeers
+            if (taggedPeersOnly && !aware) continue // forwarded frames: tag-aware peers only
+            val body = if (visited.isNotEmpty() && aware) tagged else plain
+            writeFramed(link, body)
+        }
     }
 
-    override fun sendToPeer(peerID: PeerID, packet: BlemeshPacket) {
+    override fun sendToPeer(peerID: PeerID, packet: BlemeshPacket, visited: List<PeerID>) {
         val link = peers[peerID] ?: return
-        val data = BinaryProtocol.encode(packet) ?: return
-        writeFramed(link, data)
+        val plain = BinaryProtocol.encode(packet) ?: return
+        val body = if (visited.isNotEmpty() && peerID in tagAwarePeers) {
+            BackboneFrame.encode(visited, plain)
+        } else plain
+        writeFramed(link, body)
     }
 
     override fun connectedPeerIDs(): List<PeerID> = peers.keys.toList()
+
+    override fun setPeerBackboneTag(peerID: PeerID, supported: Boolean) {
+        if (supported) tagAwarePeers.add(peerID) else tagAwarePeers.remove(peerID)
+    }
 
     // --- BroadcastReceiver for P2P intents ---
 
@@ -304,9 +321,11 @@ class WifiDirectTransport(
                     if (len <= 0 || len > MAX_PACKET) break
                     val data = ByteArray(len)
                     if (!readFully(input, data)) break
-                    val packet = BinaryProtocol.decode(data)
+                    val tag = BackboneFrame.decode(data)
+                    val visited = tag?.visited ?: emptyList()
+                    val packet = BinaryProtocol.decode(tag?.packetBytes ?: data)
                     if (packet != null) {
-                        listener?.onTransportPacketReceived(this@WifiDirectTransport, packet, link.peerID)
+                        listener?.onTransportPacketReceived(this@WifiDirectTransport, packet, link.peerID, visited)
                     }
                 }
             } catch (_: Exception) {
@@ -344,6 +363,7 @@ class WifiDirectTransport(
 
     private fun tearDownLink(link: PeerLink) {
         if (peers.remove(link.peerID) == null) return
+        tagAwarePeers.remove(link.peerID)
         link.readJob?.cancel()
         try { link.socket.close() } catch (_: Exception) {}
         listener?.onTransportPeerDisconnected(this, link.peerID)

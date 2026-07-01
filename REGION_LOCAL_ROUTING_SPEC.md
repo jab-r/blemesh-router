@@ -118,7 +118,12 @@ bridged packet **strips** any such marker — it would survive only router↔rou
 phone-relayed BLE hops. A durable "routers-visited" tag is a genuine wire change and belongs to
 **Tier 3** (`AUDIT.md §4.3`), not here. For ≤3 routers, `bridgeDeduplicator` remains the loop guard.
 
-## 7. Extension — client-declared home router (optional; DOES touch the client)
+## 7. Extension — client-declared home router (SUPERSEDED by Tier 3)
+
+> **SUPERSEDED (2026-06-30) by `BACKBONE_PATH_ROUTING_SPEC.md`.** The Tier-3 backbone visited-router
+> path tag lets a router learn `sender → home-router` from its own backbone traffic, delivering the
+> same explicit membership + targeted bridging **without any client change** (the origin entry of the
+> path tag *is* the home router). Prefer that. This client-declared variant is kept for context only.
 
 This upgrades Change 2 from *inferred* region membership to *explicit*, and adds **targeted backbone
 routing**. Unlike §4-§6 it needs a small client change, so it's an opt-in follow-on.

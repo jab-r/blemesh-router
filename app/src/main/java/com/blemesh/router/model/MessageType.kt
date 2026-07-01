@@ -56,7 +56,10 @@ enum class MessageType(val value: Byte) {
 
     // Router-to-router only (never enters the BLE mesh)
     ROUTER_PING(0x70),
-    ROUTER_PONG(0x71);
+    ROUTER_PONG(0x71),
+    // Backbone capability advertisement (BACKBONE_PATH_ROUTING_SPEC.md): sent
+    // directed to a freshly-connected router peer to negotiate path-tag support.
+    ROUTER_CAPS(0x72);
 
     companion object {
         fun from(value: Byte): MessageType? = entries.firstOrNull { it.value == value }
@@ -94,13 +97,13 @@ enum class MessageType(val value: Byte) {
 
         /**
          * Types that must NOT cross a Wi-Fi bridge in either direction:
-         * ROUTER_PING/PONG are router-internal control traffic; UWB_RANGING
+         * ROUTER_PING/PONG/CAPS are router-internal control traffic; UWB_RANGING
          * is meaningful only within BLE radio range.
          * Unknown codes: bridgeable — an include-list here silently dropped
          * PROTOCOL_ACK / HANDSHAKE_REQUEST / version negotiation / WebRTC
          * signaling between reference peers.
          */
-        private val NON_BRIDGEABLE = bytes(UWB_RANGING, ROUTER_PING, ROUTER_PONG)
+        private val NON_BRIDGEABLE = bytes(UWB_RANGING, ROUTER_PING, ROUTER_PONG, ROUTER_CAPS)
         fun isBridgeable(type: Byte): Boolean = type !in NON_BRIDGEABLE
 
         /**

@@ -13,6 +13,7 @@ import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BlemeshProtocol
+import com.blemesh.router.transport.BackboneFrame
 import com.blemesh.router.transport.LanPeerDiscovery
 import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
@@ -61,6 +62,30 @@ class MeshRouterService : Service() {
         // crossing announce (~3 missed 30s announce intervals).
         private const val HOME_ROUTER_TTL_MS = 90_000L
 
+        // --- Backbone path routing (BACKBONE_PATH_ROUTING_SPEC.md, Tier 3) ---
+        //
+        // Master flag for the visited-router path tag on the WiFi backbone.
+        // When true this router: advertises path-tag support to peer routers
+        // (ROUTER_CAPS) and sends tagged frames to those that also support it;
+        // stamps an origin visited-path on packets it bridges; drops any bridged
+        // packet whose path already contains itself (drop-on-self — the primary
+        // backbone loop guard, replacing dedup-only); learns a sender's home
+        // router from the path origin; re-forwards crossing broadcasts across
+        // the backbone (loop-free by construction) so they reach multi-hop /
+        // non-full-mesh topologies; and stops decrementing TTL on the WiFi leg
+        // (§4) so a packet can traverse many routers to a far region.
+        //
+        // When false the router behaves exactly as before: plain frames only,
+        // dedup as the sole backbone loop guard (safe at <=3 routers), and one
+        // TTL unit spent per crossing. Mixed fleets interoperate — a tag-aware
+        // router falls back to plain frames for any peer that hasn't advertised
+        // support, and dedup still bounds loops on those hops.
+        private const val BACKBONE_PATH_TAG = true
+
+        // ROUTER_CAPS payload: [capsVersion:1][capabilityBits:1].
+        private const val CAPS_VERSION: Byte = 0x01
+        private const val CAPS_BIT_PATH_TAG = 0x01
+
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
 
@@ -84,10 +109,13 @@ class MeshRouterService : Service() {
         maxEntries = 5000
     )
 
-    @Volatile var bleToBridgeCount = 0L
-        private set
-    @Volatile var bridgeToBleCount = 0L
-        private set
+    // Bridge-crossing counters. Mutated from several transport read threads
+    // concurrently, so they are AtomicLong (a plain @Volatile Long loses
+    // interleaved read-modify-write increments). Diagnostic only.
+    private val bleToBridgeCounter = AtomicLong(0)
+    private val bridgeToBleCounter = AtomicLong(0)
+    val bleToBridgeCount: Long get() = bleToBridgeCounter.get()
+    val bridgeToBleCount: Long get() = bridgeToBleCounter.get()
 
     // RTT tracking: nonce -> send time (ns). One global map; nonces are unique.
     private val outstandingPings = ConcurrentHashMap<Long, Long>()
@@ -288,17 +316,20 @@ class MeshRouterService : Service() {
             // unencrypted public MESSAGE broadcast and other content stay
             // region-local, carried by BLE mesh only. The same gate applies to
             // ttl=0 gossip-RSR replays (broadcasts of these same types).
-            // Crossing spends one TTL unit (floor 0) so a bridged packet never
-            // reaches a remote phone at MAX_TTL and looks directly linked.
-            val ttlInt = packet.ttl.toInt() and 0xFF
-            val bridged = if (ttlInt > 0) packet.withDecrementedTTL() else packet
+            //
+            // TTL: with the visited path tag as the backbone loop guard, WiFi
+            // hops no longer decrement TTL (spec §4) so an announce can reach a
+            // far region without starving; the inbound clamp on injection still
+            // prevents direct-connection masquerade. Without the tag we keep the
+            // legacy "spend one TTL unit per crossing" (floor 0) behavior.
+            val bridged = if (BACKBONE_PATH_TAG) packet else spendCrossingTtl(packet)
             if (!crossesBackbone(bridged)) {
                 Log.d(TAG, "BLE→bridge BCAST-LOCAL $tag (region-local, not bridged)")
                 return
             }
             Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
-            for (t in transports) t.broadcast(bridged)
-            bleToBridgeCount++
+            broadcastToBackbone(bridged, originVisited())
+            bleToBridgeCounter.incrementAndGet()
             return
         }
 
@@ -320,7 +351,11 @@ class MeshRouterService : Service() {
         // at MAX_TTL is treated as proof of a direct connection, so the hop
         // through us must not masquerade as the original sender.
         if (bleMeshService.isLocalPeer(recipient)) {
-            val delivered = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+            // Local delivery always spends a TTL unit regardless of the backbone
+            // decoupling: a packet handed to a phone at MAX_TTL is treated as
+            // proof of a direct connection, so the hop through us must not
+            // masquerade as the original sender.
+            val delivered = spendCrossingTtl(packet)
             val sent = bleMeshService.sendPacketToAllLegs(recipient, delivered)
             Log.d(TAG, "directed LOCAL-DELIVER $tag legs=$sent")
             return
@@ -342,12 +377,14 @@ class MeshRouterService : Service() {
 
         // 3. Recipient sits behind another router (learned from its crossing
         // announce): targeted-bridge to that one router. Also hold a copy — the
-        // route may be one announce stale if the recipient just roamed.
-        val bridged = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+        // route may be one announce stale if the recipient just roamed. TTL:
+        // decoupled on the backbone when the tag is on (spec §4); the inbound
+        // clamp guards masquerade on injection at the far router.
+        val bridged = if (BACKBONE_PATH_TAG) packet else spendCrossingTtl(packet)
         val route = freshRouteFor(recipient)
         if (route != null) {
-            route.transport.sendToPeer(route.routerPeerID, bridged)
-            bleToBridgeCount++
+            route.transport.sendToPeer(route.routerPeerID, bridged, originVisited())
+            bleToBridgeCounter.incrementAndGet()
             enqueueDmForRetry(recipient, packet)
             Log.d(TAG, "directed TARGETED $tag → ${route.transport.name}:${route.routerPeerID.rawValue.take(8)}")
             return
@@ -380,6 +417,52 @@ class MeshRouterService : Service() {
      */
     private fun fragmentInnerType(packet: BlemeshPacket): Byte? =
         if (packet.payload.size > 12) packet.payload[12] else null
+
+    // --- Backbone path routing helpers (BACKBONE_PATH_ROUTING_SPEC.md) ---
+
+    /** Spend one TTL unit (floor 0). Used for the anti-masquerade hop cost. */
+    private fun spendCrossingTtl(packet: BlemeshPacket): BlemeshPacket =
+        if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+
+    /**
+     * The visited path this router stamps on a packet it originates onto the
+     * backbone: `[myPeerID]` when the tag is enabled, empty otherwise (plain
+     * frames, legacy behavior). The origin entry lets receivers learn the
+     * sender's home router (spec §3).
+     */
+    private fun originVisited(): List<PeerID> =
+        if (BACKBONE_PATH_TAG) listOf(myPeerID) else emptyList()
+
+    /** Fan a packet out to every backbone transport with the given visited path. */
+    private fun broadcastToBackbone(
+        packet: BlemeshPacket,
+        visited: List<PeerID>,
+        taggedPeersOnly: Boolean = false
+    ) {
+        for (t in transports) t.broadcast(packet, visited, taggedPeersOnly)
+    }
+
+    /**
+     * Re-forward a crossing broadcast across the backbone (spec §2, §5) so it
+     * propagates over multi-hop / non-full-mesh topologies (e.g. a ring).
+     * Loop-free by construction: we append ourselves to the visited path and
+     * each transport floods only to tag-aware peers not already on the path
+     * (split-horizon); a packet that returns to a router on its own path is
+     * dropped by the drop-on-self guard. A path at the length bound is not
+     * extended — the next hop would drop it anyway.
+     *
+     * Forwarded frames go to tag-aware peers ONLY ([broadcastToBackbone] with
+     * taggedPeersOnly): a non-tag-aware peer would receive the forwarded frame
+     * as a plain (empty-path) frame and mis-learn US, the forwarder, as the
+     * sender's home router instead of the true origin (visited[0]). Such a peer
+     * still learns the correct home router from the origin's direct broadcast,
+     * and can't forward further anyway.
+     */
+    private fun forwardBroadcastOnBackbone(packet: BlemeshPacket, visited: List<PeerID>) {
+        val forwardPath = visited + myPeerID
+        if (forwardPath.size > BackboneFrame.MAX_VISITED) return
+        broadcastToBackbone(packet, forwardPath, taggedPeersOnly = true)
+    }
 
     /** The recipient's home router if we have a fresh, currently-connected route. */
     private fun freshRouteFor(recipient: PeerID): RouterRoute? {
@@ -424,10 +507,15 @@ class MeshRouterService : Service() {
         for (entry in snapshot) {
             if (now - entry.enqueuedMs > DM_QUEUE_MAX_AGE_MS) continue
             val p = entry.packet
-            val hop = if ((p.ttl.toInt() and 0xFF) > 0) p.withDecrementedTTL() else p
             when {
-                localNow -> { bleMeshService.sendPacketToAllLegs(recipient, hop); delivered++ }
-                route != null -> { route.transport.sendToPeer(route.routerPeerID, hop); bleToBridgeCount++ }
+                // Local delivery spends a TTL unit (anti-masquerade), always.
+                localNow -> { bleMeshService.sendPacketToAllLegs(recipient, spendCrossingTtl(p)); delivered++ }
+                // Backbone leg: TTL decoupled when the tag is on (spec §4).
+                route != null -> {
+                    val hop = if (BACKBONE_PATH_TAG) p else spendCrossingTtl(p)
+                    route.transport.sendToPeer(route.routerPeerID, hop, originVisited())
+                    bleToBridgeCounter.incrementAndGet()
+                }
             }
         }
         if (localNow) {
@@ -509,6 +597,10 @@ class MeshRouterService : Service() {
     private val transportListener = object : RouterTransport.Listener {
         override fun onTransportPeerConnected(transport: RouterTransport, peer: PeerID) {
             Log.i(TAG, "Router peer connected via ${transport.name}: ${peer.rawValue.take(8)}")
+            // Advertise our backbone path-tag support so the peer knows it may
+            // send us tagged frames (and we learn the same from its reply).
+            // Until the caps round-trip completes both sides use plain frames.
+            if (BACKBONE_PATH_TAG) sendRouterCaps(transport, peer)
         }
 
         override fun onTransportPeerDisconnected(transport: RouterTransport, peer: PeerID) {
@@ -518,16 +610,18 @@ class MeshRouterService : Service() {
         override fun onTransportPacketReceived(
             transport: RouterTransport,
             packet: BlemeshPacket,
-            fromPeer: PeerID
+            fromPeer: PeerID,
+            visited: List<PeerID>
         ) {
-            routeBridgePacketToBle(transport, packet, fromPeer)
+            routeBridgePacketToBle(transport, packet, fromPeer, visited)
         }
     }
 
     private fun routeBridgePacketToBle(
         fromTransport: RouterTransport,
         packet: BlemeshPacket,
-        fromRouter: PeerID
+        fromRouter: PeerID,
+        visited: List<PeerID>
     ) {
         // Router-internal control traffic: never inject into BLE, never multi-hop.
         when (packet.type) {
@@ -539,12 +633,36 @@ class MeshRouterService : Service() {
                 handleRouterPong(fromTransport, packet, fromRouter)
                 return
             }
+            MessageType.ROUTER_CAPS.value -> {
+                handleRouterCaps(fromTransport, packet, fromRouter)
+                return
+            }
         }
 
         // Mirror the BLE→bridge direction: link-local types arriving from an
         // older or non-compliant peer router must not leak into this segment
         // or be multi-hopped onward.
         if (!MessageType.isBridgeable(packet.type)) return
+
+        // Backbone loop guard (spec §2): a packet whose visited path already
+        // contains us has looped back — drop it. This is the primary loop guard
+        // for the tagged backbone, loop-free by construction at any router
+        // count; the dedup below stays as a backstop (BLE-origin dupes, and
+        // untagged hops from legacy peers).
+        if (BACKBONE_PATH_TAG && myPeerID in visited) {
+            Log.d(TAG, "bridge→BLE DROP-LOOP ${packetTag(packet)} (self on path, len=${visited.size})")
+            return
+        }
+        // Path-length bound (spec §2): drop only a path that would *exceed* the
+        // bound — a path AT the bound (== MAX_VISITED) is still delivered, and
+        // forwardBroadcastOnBackbone declines to grow it to MAX_VISITED+1. This
+        // matches the forward guard so the full 16-router budget is usable, not
+        // capped at 15. Defensive: the decoder already rejects count >
+        // MAX_VISITED, so this fires only if a future format relaxes that.
+        if (visited.size > BackboneFrame.MAX_VISITED) {
+            Log.w(TAG, "bridge→BLE DROP-MAXPATH ${packetTag(packet)} (path=${visited.size})")
+            return
+        }
 
         val dedupKey = "br2ble-${packet.senderId}-${packet.wireTimestamp}-${packet.type}"
         if (bridgeDeduplicator.isDuplicate(dedupKey)) return
@@ -557,16 +675,20 @@ class MeshRouterService : Service() {
         }
 
         // Learn which router a peer sits behind from its ANNOUNCE crossing the
-        // backbone — the routing table for targeted directed bridging. On a
-        // change (first sighting or a roam to a different router) re-route any
-        // DMs we're currently holding for that peer.
+        // backbone — the routing table for targeted directed bridging. The
+        // authoritative home router is the path *origin* (visited[0]), not the
+        // previous hop: under multi-hop forwarding fromRouter is only the router
+        // that relayed the announce to us. Fall back to fromRouter for an
+        // untagged/legacy frame. On a change (first sighting or a roam) re-route
+        // any DMs we're holding for that peer.
         if (packet.type == MessageType.ANNOUNCE.value || packet.type == MessageType.LOXATION_ANNOUNCE.value) {
+            val originRouter = visited.firstOrNull() ?: fromRouter
             PeerID.fromLongBE(packet.senderId)?.let { sender ->
-                if (sender != myPeerID) {
+                if (sender != myPeerID && sender != originRouter) {
                     val prev = peerToHomeRouter.put(
-                        sender, RouterRoute(fromTransport, fromRouter, System.currentTimeMillis())
+                        sender, RouterRoute(fromTransport, originRouter, System.currentTimeMillis())
                     )
-                    if (prev == null || prev.routerPeerID != fromRouter) flushDmQueue(sender)
+                    if (prev == null || prev.routerPeerID != originRouter) flushDmQueue(sender)
                 }
             }
         }
@@ -580,32 +702,77 @@ class MeshRouterService : Service() {
             return
         }
 
-        // A compliant sender spends a TTL unit for the crossing, so arrival
-        // at MAX_TTL means a pre-fix or non-compliant build. Clamp before
-        // injection, or local reference phones bind the original sender's
-        // PeerID to our BLE address — the masquerade bug the BLE→bridge
-        // direction already guards against.
+        // A compliant sender arrives at <= MAX_TTL-1 (TTL is spent on the
+        // crossing when the tag is off; when it is on TTL is decoupled and the
+        // packet may arrive at MAX_TTL). Either way, clamp any MAX_TTL arrival
+        // before injection or local reference phones bind the original sender's
+        // PeerID to our BLE address — the direct-connection masquerade bug.
         val inbound = if ((packet.ttl.toInt() and 0xFF) >= BlemeshPacket.MAX_TTL) {
             packet.withTTL((BlemeshPacket.MAX_TTL - 1).toByte())
         } else packet
 
         val tag = packetTag(inbound)
         trackRetry("br→ble", inbound)
-        Log.d(TAG, "bridge→BLE ${fromTransport.name}<-${fromRouter.rawValue.take(8)} $tag")
+        Log.d(TAG, "bridge→BLE ${fromTransport.name}<-${fromRouter.rawValue.take(8)} $tag path=${visited.size}")
         bleMeshService.injectPacketFromWifi(inbound)
-        bridgeToBleCount++
+        bridgeToBleCounter.incrementAndGet()
 
-        // No router-to-router re-forwarding. The LAN transport is a full mesh
-        // (mDNS makes every router connect to every other), so each router
-        // bridges its own region's announces directly to all peer routers and
-        // targets a directed DM straight at the recipient's home router — one
-        // hop reaches everyone. Re-forwarding would (a) re-fan-out targeted DMs,
-        // undoing the backbone saving, and (b) let a *forwarding* router look
-        // like a peer's home router (the peer→home-router map is inferred from
-        // whoever bridged the announce), mis-targeting DMs. Keeping delivery to
-        // one hop makes the map authoritative: home == the router that heard the
-        // peer over BLE. Non-full-mesh / 4+ router topologies need the
-        // routers-visited TLV (Tier-3, AUDIT.md §5) — out of scope here.
+        // Multi-hop backbone forwarding (spec §2, §5). Re-forward crossing
+        // broadcasts (announce / presence) so they propagate over multi-hop /
+        // non-full-mesh topologies; drop-on-self above + the dedup backstop
+        // keep it loop-free and bounded (a router forwards a given packet at
+        // most once — the second copy is deduped before reaching here). Forward
+        // the ORIGINAL packet, not the TTL-clamped inbound copy: the clamp is a
+        // BLE-injection concern, while the backbone leg stays TTL-decoupled and
+        // each downstream router re-clamps on its own injection.
+        //
+        // Directed traffic is NOT flooded: the origin targets the recipient's
+        // home router directly (targeted bridging, spec §3). A directed packet
+        // that reaches the wrong router is injected locally above (the mesh
+        // relay delivers it if the recipient is a region member) but is not
+        // re-forwarded onto the backbone.
+        //
+        // Only re-forward a broadcast that arrived *tagged* (non-empty path):
+        // extending an existing path preserves its origin (visited[0]). An
+        // untagged broadcast came from a legacy peer that already fanned it to
+        // its own peers; re-forwarding it would falsely stamp US as the origin
+        // and corrupt downstream home-router learning, so we leave it region-
+        // terminal (dedup-safe, matching pre-tag behavior for legacy origins).
+        if (BACKBONE_PATH_TAG && packet.isBroadcast && visited.isNotEmpty()) {
+            forwardBroadcastOnBackbone(packet, visited)
+        }
+    }
+
+    /** Build and send a ROUTER_CAPS advertisement (directed) to [peer]. */
+    private fun sendRouterCaps(transport: RouterTransport, peer: PeerID) {
+        val bits = if (BACKBONE_PATH_TAG) CAPS_BIT_PATH_TAG else 0
+        val payload = byteArrayOf(CAPS_VERSION, bits.toByte())
+        val packet = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ROUTER_CAPS.value,
+            ttl = 1.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
+            senderId = myPeerID.toLongBE(),
+            recipientId = peer.toLongBE(),
+            payload = payload,
+            signature = null
+        )
+        // Always a plain frame — this IS the negotiation, so the peer can't be
+        // assumed tag-aware yet. A legacy router consumes it via its
+        // addressed-to-this-router check and never injects it into BLE.
+        transport.sendToPeer(peer, packet, emptyList())
+    }
+
+    /**
+     * Record a peer router's advertised backbone capabilities so we only send
+     * it tagged frames once it has confirmed support (spec §6 rollout).
+     */
+    private fun handleRouterCaps(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
+        val supportsTag = packet.payload.size >= 2 &&
+            (packet.payload[1].toInt() and CAPS_BIT_PATH_TAG) != 0
+        fromTransport.setPeerBackboneTag(fromRouter, supportsTag)
+        Log.d(TAG, "ROUTER_CAPS from ${fromRouter.rawValue.take(8)} via ${fromTransport.name}: pathTag=$supportsTag")
     }
 
     // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---

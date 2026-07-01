@@ -110,4 +110,8 @@ dependencies {
     // X25519/Ed25519 (lightweight API, no JCA provider registration) for the
     // router's Noise-static identity and signed ANNOUNCE frames.
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // Pure-JVM unit tests (no Android framework) for wire-format codecs like
+    // BackboneFrame and PeerID. Run with ./gradlew :app:testDebugUnitTest.
+    testImplementation("junit:junit:4.13.2")
 }

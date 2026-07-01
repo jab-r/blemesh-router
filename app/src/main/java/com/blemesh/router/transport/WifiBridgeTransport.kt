@@ -46,6 +46,9 @@ class WifiBridgeTransport(
     override var listener: RouterTransport.Listener? = null
 
     private val connections = ConcurrentHashMap<PeerID, RouterConnection>()
+    // Peers that advertised backbone path-tag support (ROUTER_CAPS). Only these
+    // are sent tagged frames; everyone else gets plain frames.
+    private val tagAwarePeers = ConcurrentHashMap.newKeySet<PeerID>()
     private val dialTargets = ConcurrentHashMap<String, Job>()
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
@@ -85,20 +88,32 @@ class WifiBridgeTransport(
         Log.i(TAG, "TCP bridge transport stopped")
     }
 
-    override fun broadcast(packet: BlemeshPacket) {
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        for (conn in connections.values) {
-            sendRaw(conn, encoded)
+    override fun broadcast(packet: BlemeshPacket, visited: List<PeerID>, taggedPeersOnly: Boolean) {
+        val plain = BinaryProtocol.encode(packet) ?: return
+        val tagged = if (visited.isNotEmpty()) BackboneFrame.encode(visited, plain) else plain
+        for ((peerID, conn) in connections) {
+            if (peerID in visited) continue // split-horizon: already on the path
+            val aware = peerID in tagAwarePeers
+            if (taggedPeersOnly && !aware) continue // forwarded frames: tag-aware peers only
+            val body = if (visited.isNotEmpty() && aware) tagged else plain
+            sendRaw(conn, body)
         }
     }
 
-    override fun sendToPeer(peerID: PeerID, packet: BlemeshPacket) {
+    override fun sendToPeer(peerID: PeerID, packet: BlemeshPacket, visited: List<PeerID>) {
         val conn = connections[peerID] ?: return
-        val encoded = BinaryProtocol.encode(packet) ?: return
-        sendRaw(conn, encoded)
+        val plain = BinaryProtocol.encode(packet) ?: return
+        val body = if (visited.isNotEmpty() && peerID in tagAwarePeers) {
+            BackboneFrame.encode(visited, plain)
+        } else plain
+        sendRaw(conn, body)
     }
 
     override fun connectedPeerIDs(): List<PeerID> = connections.keys.toList()
+
+    override fun setPeerBackboneTag(peerID: PeerID, supported: Boolean) {
+        if (supported) tagAwarePeers.add(peerID) else tagAwarePeers.remove(peerID)
+    }
 
     // --- Public manual-config API ---
 
@@ -310,6 +325,7 @@ class WifiBridgeTransport(
         }
         conn.readJob?.cancel()
         try { conn.socket.close() } catch (_: Exception) { }
+        tagAwarePeers.remove(peerID)
         listener?.onTransportPeerDisconnected(this, peerID)
     }
 
@@ -326,7 +342,10 @@ class WifiBridgeTransport(
             if (wasActive) connections.remove(conn.peerID)
         }
         try { conn.socket.close() } catch (_: Exception) { }
-        if (wasActive) listener?.onTransportPeerDisconnected(this, conn.peerID)
+        if (wasActive) {
+            tagAwarePeers.remove(conn.peerID)
+            listener?.onTransportPeerDisconnected(this, conn.peerID)
+        }
     }
 
     // --- Read loop ---
@@ -342,9 +361,13 @@ class WifiBridgeTransport(
                     }
                     val data = ByteArray(length)
                     conn.input.readFully(data)
-                    val packet = BinaryProtocol.decode(data)
+                    // A tagged frame carries the visited-router path ahead of the
+                    // packet; a plain frame is the bare packet (empty path).
+                    val tag = BackboneFrame.decode(data)
+                    val visited = tag?.visited ?: emptyList()
+                    val packet = BinaryProtocol.decode(tag?.packetBytes ?: data)
                     if (packet != null) {
-                        listener?.onTransportPacketReceived(this@WifiBridgeTransport, packet, conn.peerID)
+                        listener?.onTransportPacketReceived(this@WifiBridgeTransport, packet, conn.peerID, visited)
                     }
                 }
             } catch (e: Exception) {
