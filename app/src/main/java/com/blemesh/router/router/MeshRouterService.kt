@@ -345,7 +345,8 @@ class MeshRouterService : Service() {
      */
     private fun routeDirected(recipient: PeerID, packet: BlemeshPacket, tag: String) {
         // 1. Directly connected: the router is the most reliable path (P2P BLE
-        // may be weak, and NOISE_ENCRYPTED 0x12 is never relayed by phones).
+        // may be weak, and 0x12 relay isn't guaranteed on every hop — some
+        // phones/builds still drop it, so a direct write is the surest path).
         // Write to every live leg (iOS holds dual connections; the primary
         // address bounces under churn). Decrement TTL first: a packet arriving
         // at MAX_TTL is treated as proof of a direct connection, so the hop
@@ -368,8 +369,9 @@ class MeshRouterService : Service() {
 
         // 2. Relayable type to a multi-hop member of our own BLE region: the
         // mesh relay (BleMeshService.processIncomingPacket) already carries it
-        // the last hops. Nothing to bridge, nothing to hold. (0x12 is not
-        // relayable, so it never stops here.)
+        // the last hops. Nothing to bridge, nothing to hold. 0x12 is now
+        // relayable too (iOS parity), so a private DM to a region member is
+        // carried by the mesh relay like any other type.
         if (BlemeshProtocol.isRelayablePacketType(packet.type) && bleMeshService.isRegionMember(recipient)) {
             Log.d(TAG, "directed REGION-RELAY $tag (delivered by mesh relay)")
             return
