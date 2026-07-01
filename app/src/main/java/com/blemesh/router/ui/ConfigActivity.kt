@@ -1,5 +1,8 @@
 package com.blemesh.router.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -12,6 +15,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.graphics.Typeface
 import androidx.activity.ComponentActivity
+import com.blemesh.router.router.BeaconIdentity
 import com.blemesh.router.router.WifiCredentials
 import com.blemesh.router.router.WifiNetworkApplicator
 
@@ -26,6 +30,7 @@ class ConfigActivity : ComponentActivity() {
 
     private lateinit var ssidField: EditText
     private lateinit var pskField: EditText
+    private lateinit var beaconId: String
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,6 +77,38 @@ class ConfigActivity : ComponentActivity() {
             setOnClickListener { onClear() }
         }
 
+        beaconId = BeaconIdentity.load(this)
+        val beaconHeader = TextView(this).apply {
+            text = "Beacon"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 32, 0, 8)
+        }
+        val beaconHelp = TextView(this).apply {
+            text = "This router advertises the id below as a BLE beacon. Register " +
+                "it on the loxation server as a fixed/location beacon at the " +
+                "router's install location; nearby loxation clients will then " +
+                "report sightings with no app update."
+            textSize = 13f
+            setPadding(0, 0, 0, 8)
+        }
+        val beaconValue = TextView(this).apply {
+            text = beaconId
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
+            setPadding(0, 0, 0, 2)
+        }
+        val beaconUuid = TextView(this).apply {
+            text = BeaconIdentity.asDashedUuid(beaconId)
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setPadding(0, 0, 0, 8)
+        }
+        val copyBeaconButton = Button(this).apply {
+            text = "Copy id"
+            setOnClickListener { onCopyBeaconId() }
+        }
+
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.TOP or Gravity.START
@@ -85,6 +122,11 @@ class ConfigActivity : ComponentActivity() {
         column.addView(pskField)
         column.addView(saveButton)
         column.addView(clearButton)
+        column.addView(beaconHeader)
+        column.addView(beaconHelp)
+        column.addView(beaconValue)
+        column.addView(beaconUuid)
+        column.addView(copyBeaconButton)
 
         return ScrollView(this).apply {
             addView(
@@ -124,5 +166,11 @@ class ConfigActivity : ComponentActivity() {
         ssidField.setText("")
         pskField.setText("")
         Toast.makeText(this, "Cleared", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun onCopyBeaconId() {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Beacon id", beaconId))
+        Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
     }
 }

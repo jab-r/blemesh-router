@@ -12,6 +12,7 @@ import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.protocol.BlemeshProtocol
+import com.blemesh.router.router.BeaconIdentity
 import com.blemesh.router.router.LocalIdentity
 import com.blemesh.router.sync.GossipSyncManager
 import com.blemesh.router.sync.RequestSyncPacket
@@ -39,6 +40,7 @@ import java.util.concurrent.TimeUnit
 class BleMeshService(
     private val context: Context,
     private val identity: LocalIdentity.RouterIdentity,
+    private val beaconId: String,
     private val scope: CoroutineScope
 ) {
     val myPeerID: PeerID = identity.peerID
@@ -87,6 +89,11 @@ class BleMeshService(
         private const val SNF_MAX_AGE_MS = 60_000L
         // Sweep idle buffers (peer never reconnects) on this cadence.
         private const val SNF_SWEEP_INTERVAL_MS = 15_000L
+
+        // Region-membership: how long since we last heard a peer's packet
+        // originate over BLE before it's considered to have left this router's
+        // BLE region. ~3 missed announce intervals (ANNOUNCE_INTERVAL_MS=30s).
+        private const val REGION_MEMBER_TTL_MS = 90_000L
 
         // Approximate BlemeshPacket header overhead (version+type+ttl+flags+ts+payloadLen+sender+recipient)
         private const val BLEMESH_PACKET_OVERHEAD = 30
@@ -145,6 +152,14 @@ class BleMeshService(
     // we don't buffer packets for peers we've never directly served, since
     // those flow only over the bridge.
     private val knownLocalPeers: MutableSet<PeerID> = ConcurrentHashMap.newKeySet()
+
+    // Region membership: PeerID -> last time we saw one of its packets originate
+    // over BLE (directly or several relay hops away). A superset of
+    // peerIdToAddress (which is directly-connected only). The router uses this
+    // to know a directed packet's recipient is reachable inside its local BLE
+    // region, so a relayable message to it is delivered by the mesh relay and
+    // need not cross the Wi-Fi backbone. Aged out on REGION_MEMBER_TTL_MS.
+    private val regionMembers = ConcurrentHashMap<PeerID, Long>()
 
     // All currently live BLE addresses observed for a given peer. iOS clients
     // routinely surface as TWO simultaneous connections to us (server-side
@@ -229,6 +244,7 @@ class BleMeshService(
         pendingByPeer.clear()
         knownLocalPeers.clear()
         peerToLiveAddresses.clear()
+        regionMembers.clear()
     }
 
     private fun startRssiPolling() {
@@ -326,6 +342,9 @@ class BleMeshService(
                     }
                 }
                 for (k in emptyKeys) pendingByPeer.remove(k)
+
+                // Age out region members not heard from within the TTL.
+                regionMembers.entries.removeAll { now - it.value > REGION_MEMBER_TTL_MS }
             }
         }
     }
@@ -400,6 +419,16 @@ class BleMeshService(
     /** Check if a PeerID is reachable via local BLE mesh. */
     fun isLocalPeer(peerID: PeerID): Boolean {
         return peerIdToAddress.containsKey(peerID)
+    }
+
+    /**
+     * Whether [peerID] is a member of this router's local BLE region — i.e. we
+     * have recently seen one of its packets originate over BLE (directly or via
+     * relay hops), within REGION_MEMBER_TTL_MS. A superset of [isLocalPeer].
+     */
+    fun isRegionMember(peerID: PeerID): Boolean {
+        val lastSeen = regionMembers[peerID] ?: return false
+        return System.currentTimeMillis() - lastSeen <= REGION_MEMBER_TTL_MS
     }
 
     /** Last observed RSSI for a connected BLE peer, or null if unknown. */
@@ -576,8 +605,15 @@ class BleMeshService(
                 .setIncludeDeviceName(false)
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
                 .build()
-            bleAdvertiser?.startAdvertising(settings, data, advertiseCallback)
-            Log.d(TAG, "BLE advertising started")
+            // Beacon element rides in the scan response (the primary AD is near
+            // full with the 128-bit service UUID). Generic manufacturer data,
+            // company 0xFFFF + 16 id bytes = 20 B, well under the 31 B budget.
+            val scanResponse = AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addManufacturerData(BeaconIdentity.COMPANY_ID, BeaconIdentity.manufacturerBytes(beaconId))
+                .build()
+            bleAdvertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+            Log.d(TAG, "BLE advertising started (beacon id $beaconId)")
         } catch (e: SecurityException) {
             Log.e(TAG, "Missing BLE advertise permission", e)
         }
@@ -880,6 +916,12 @@ class BleMeshService(
         // re-broadcast over the bridge a second time.
         val packetId = buildDeduplicationKey(packet)
         if (deduplicator.isDuplicate(packetId)) return
+
+        // Region membership: this packet genuinely originated over BLE (it
+        // passed dedup, so it is not a WiFi-injected packet echoed back — those
+        // were already recorded by injectPacketFromWifi). Its sender is
+        // reachable inside our local BLE region. Stamp last-seen.
+        PeerID.fromLongBE(packet.senderId)?.let { regionMembers[it] = System.currentTimeMillis() }
 
         val messageType = MessageType.from(packet.type)
 

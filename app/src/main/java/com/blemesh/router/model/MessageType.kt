@@ -139,6 +139,20 @@ enum class MessageType(val value: Byte) {
         fun isGossipStored(type: Byte): Boolean = type in GOSSIP_STORED
 
         /**
+         * Broadcast types that still cross the Wi-Fi backbone under region-local
+         * routing. Announce/presence broadcasts must propagate for cross-router
+         * discovery (a router learns which router a peer sits behind from that
+         * peer's crossing announce, and phones learn remote peers exist). The
+         * unencrypted public MESSAGE broadcast is deliberately NOT here — public
+         * chat stays region-local; it is the bulk broadcast traffic we cut off
+         * the backbone. A FRAGMENT is classified by its inner reassembled type
+         * (see MeshRouterService), not by 0x05 itself.
+         * Unknown codes: NOT crossed — only propagate presence types we know.
+         */
+        private val CROSSES_BACKBONE = bytes(ANNOUNCE, LOXATION_ANNOUNCE, LEAVE, LOCATION_UPDATE)
+        fun crossesBackboneAsBroadcast(type: Byte): Boolean = type in CROSSES_BACKBONE
+
+        /**
          * Counted by the retry-storm diagnostic. ANNOUNCE is a periodic
          * heartbeat (very chatty); FRAGMENT de-duplicates via its fragment
          * ID. Storms on NOISE_HANDSHAKE / NOISE_ENCRYPTED / MESSAGE /

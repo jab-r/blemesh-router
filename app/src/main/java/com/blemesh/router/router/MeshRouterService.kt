@@ -12,6 +12,7 @@ import com.blemesh.router.mesh.BleMeshService
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
+import com.blemesh.router.protocol.BlemeshProtocol
 import com.blemesh.router.transport.LanPeerDiscovery
 import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
@@ -49,6 +50,16 @@ class MeshRouterService : Service() {
         // Sliding window for the retry-storm counter. A (sender,recipient,type)
         // bucket resets if no new origination is seen for this long.
         private const val RETRY_WINDOW_MS = 30_000L
+
+        // Directed-DM retry queue (region-local routing). A DM whose recipient
+        // isn't immediately deliverable is held and re-routed as the recipient's
+        // announces reveal its current router (mobility), then expired.
+        private const val DM_QUEUE_MAX_AGE_MS = 120_000L
+        private const val DM_QUEUE_MAX_PER_PEER = 32
+        private const val DM_SWEEP_INTERVAL_MS = 15_000L
+        // How long a learned peer->home-router route stays valid without a fresh
+        // crossing announce (~3 missed 30s announce intervals).
+        private const val HOME_ROUTER_TTL_MS = 90_000L
 
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
@@ -94,13 +105,33 @@ class MeshRouterService : Service() {
     private data class RetryCounter(var count: Int, var firstSeenMs: Long, var lastSeenMs: Long)
     private val packetRetryCounts = ConcurrentHashMap<String, RetryCounter>()
 
+    // Region-local routing (REGION_LOCAL_ROUTING_SPEC.md).
+    //
+    // peerToHomeRouter: which router a peer sits behind, learned from that
+    // peer's ANNOUNCE crossing the backbone from that router. Drives targeted
+    // bridging (send a directed DM to the one router that owns the recipient
+    // instead of fanning out) and self-heals on roam (last crossing announce
+    // wins). Aged out on HOME_ROUTER_TTL_MS.
+    private data class RouterRoute(val transport: RouterTransport, val routerPeerID: PeerID, val lastSeenMs: Long)
+    private val peerToHomeRouter = ConcurrentHashMap<PeerID, RouterRoute>()
+
+    // dmRetryQueue: directed DMs held for a recipient that isn't immediately
+    // deliverable (moved / briefly offline). Re-routed when the recipient's
+    // announce reveals its current router or it reappears locally; expired after
+    // DM_QUEUE_MAX_AGE_MS. Never fanned out, never dropped mid-window.
+    private data class QueuedDm(val packet: BlemeshPacket, val enqueuedMs: Long)
+    private val dmRetryQueue = ConcurrentHashMap<PeerID, ArrayDeque<QueuedDm>>()
+    private var dmSweepJob: Job? = null
+
     override fun onCreate() {
         super.onCreate()
         val identity = LocalIdentity.load(this)
         myPeerID = identity.peerID
         Log.i(TAG, "MeshRouterService created, PeerID: ${myPeerID.rawValue}")
 
-        bleMeshService = BleMeshService(this, identity, serviceScope)
+        val beaconId = BeaconIdentity.load(this)
+        Log.i(TAG, "Beacon id: $beaconId")
+        bleMeshService = BleMeshService(this, identity, beaconId, serviceScope)
         bleMeshService.packetListener = blePacketListener
 
         transports = TransportSelector.build(this, myPeerID, serviceScope)
@@ -153,6 +184,7 @@ class MeshRouterService : Service() {
         }
 
         startRttProbing()
+        startDmSweep()
 
         Log.i(TAG, "Router started with ${transports.size} transport(s)")
         return START_STICKY
@@ -162,8 +194,12 @@ class MeshRouterService : Service() {
         super.onDestroy()
         rttJob?.cancel()
         rttJob = null
+        dmSweepJob?.cancel()
+        dmSweepJob = null
         outstandingPings.clear()
         rttByTransportPeer.clear()
+        peerToHomeRouter.clear()
+        dmRetryQueue.clear()
         lanDiscovery.stop()
         bleMeshService.stop()
         for (t in transports) t.stop()
@@ -218,6 +254,13 @@ class MeshRouterService : Service() {
     private val blePacketListener = object : BleMeshService.PacketListener {
         override fun onPacketReceived(packet: BlemeshPacket, fromAddress: String) {
             routeBlePacketToBridge(packet)
+            // If a peer we're holding DMs for is now directly reachable over
+            // BLE, deliver them (it came back / arrived in our region).
+            PeerID.fromLongBE(packet.senderId)?.let { sender ->
+                if (dmRetryQueue.containsKey(sender) && bleMeshService.isLocalPeer(sender)) {
+                    flushDmQueue(sender)
+                }
+            }
         }
 
         override fun onPeerDiscovered(peerID: PeerID, address: String) {
@@ -239,62 +282,187 @@ class MeshRouterService : Service() {
         trackRetry("ble→br", packet)
 
         val recipient = packet.recipientPeerID()
-        if (recipient != null && bleMeshService.isLocalPeer(recipient)) {
-            // Both endpoints are local. The router is the most reliable path
-            // between them: peer-to-peer BLE may be weak (the very reason we
-            // exist), and NOISE_ENCRYPTED bypasses BLE-mesh relay entirely
-            // (BlemeshProtocol.shouldRelay returns false for type 0x12), so
-            // without an explicit targeted write the recipient never sees it.
-            //
-            // Write to every live BLE leg of the recipient: iOS routinely
-            // holds two simultaneous connections (server-side accept +
-            // client-side dial) and the "primary" address bounces sub-second
-            // under reconnect churn. Hitting all legs makes us robust to that
-            // race; the recipient dedups duplicates.
-            //
-            // Decrement TTL before delivering: reference peers treat a packet
-            // arriving at MAX_TTL as proof of a direct connection and bind the
-            // sending BLE address (ours) to the packet's sender PeerID. The
-            // hop through us must not masquerade as the original sender.
-            val delivered = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
-            val sent = bleMeshService.sendPacketToAllLegs(recipient, delivered)
-            Log.d(TAG, "BLE→bridge LOCAL-DELIVER $tag legs=$sent")
-            return
-        }
-
-        // Crossing the bridge is a hop: spend one TTL unit (floor 0) so the
-        // packet never arrives at a remote phone at MAX_TTL and masquerades
-        // as a direct connection (see above). Low-TTL packets still cross:
-        // gossip replays are emitted at ttl=0 ("local-only" in the
-        // references) but the bridge is the only cross-segment backfill
-        // path — routers don't gossip-sync each other over Wi-Fi. They
-        // arrive at the far segment at ttl=0: delivered to that router's
-        // directly connected phones, never re-relayed. REQUEST_SYNC keeps
-        // the old rule — a ttl=0 sync request describes the local segment
-        // and is answered by the local router.
-        val ttlInt = packet.ttl.toInt() and 0xFF
-        if (packet.type == MessageType.REQUEST_SYNC.value && ttlInt == 0) return
-        val bridged = if (ttlInt > 0) packet.withDecrementedTTL() else packet
-
-        if (bridged.isBroadcast) {
+        if (recipient == null) {
+            // Broadcast. Region-local rule: only announce/presence broadcasts
+            // cross the backbone (they carry cross-router discovery); the
+            // unencrypted public MESSAGE broadcast and other content stay
+            // region-local, carried by BLE mesh only. The same gate applies to
+            // ttl=0 gossip-RSR replays (broadcasts of these same types).
+            // Crossing spends one TTL unit (floor 0) so a bridged packet never
+            // reaches a remote phone at MAX_TTL and looks directly linked.
+            val ttlInt = packet.ttl.toInt() and 0xFF
+            val bridged = if (ttlInt > 0) packet.withDecrementedTTL() else packet
+            if (!crossesBackbone(bridged)) {
+                Log.d(TAG, "BLE→bridge BCAST-LOCAL $tag (region-local, not bridged)")
+                return
+            }
             Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
             for (t in transports) t.broadcast(bridged)
             bleToBridgeCount++
             return
         }
 
-        // Directed: send via the transport that has the recipient if any,
-        // otherwise broadcast to all transports.
-        val targeted = recipient?.let { r ->
-            transports.firstOrNull { r in it.connectedPeerIDs() }?.also { it.sendToPeer(r, bridged) }
+        // Directed 1:1 DM — route it to the recipient (never fanout, never drop).
+        routeDirected(recipient, packet, tag)
+    }
+
+    /**
+     * Route a directed packet to [recipient]. The router's primary job: deliver
+     * a 1:1 DM to wherever the recipient is, or hold it and retry until we learn
+     * where it went. Order: local direct → local relayable region member →
+     * targeted bridge to the recipient's home router → hold for retry.
+     */
+    private fun routeDirected(recipient: PeerID, packet: BlemeshPacket, tag: String) {
+        // 1. Directly connected: the router is the most reliable path (P2P BLE
+        // may be weak, and NOISE_ENCRYPTED 0x12 is never relayed by phones).
+        // Write to every live leg (iOS holds dual connections; the primary
+        // address bounces under churn). Decrement TTL first: a packet arriving
+        // at MAX_TTL is treated as proof of a direct connection, so the hop
+        // through us must not masquerade as the original sender.
+        if (bleMeshService.isLocalPeer(recipient)) {
+            val delivered = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+            val sent = bleMeshService.sendPacketToAllLegs(recipient, delivered)
+            Log.d(TAG, "directed LOCAL-DELIVER $tag legs=$sent")
+            return
         }
-        if (targeted != null) {
-            Log.d(TAG, "BLE→bridge DIRECT $tag via ${targeted.name}")
-        } else {
-            Log.d(TAG, "BLE→bridge FANOUT $tag via ${transports.joinToString(",") { it.name }}")
-            for (t in transports) t.broadcast(bridged)
+
+        // A ttl=0 REQUEST_SYNC describes the local segment and is answered by
+        // the local router — delivered above if its recipient is directly
+        // connected, otherwise it must never cross the bridge or be held.
+        if (packet.type == MessageType.REQUEST_SYNC.value && (packet.ttl.toInt() and 0xFF) == 0) return
+
+        // 2. Relayable type to a multi-hop member of our own BLE region: the
+        // mesh relay (BleMeshService.processIncomingPacket) already carries it
+        // the last hops. Nothing to bridge, nothing to hold. (0x12 is not
+        // relayable, so it never stops here.)
+        if (BlemeshProtocol.isRelayablePacketType(packet.type) && bleMeshService.isRegionMember(recipient)) {
+            Log.d(TAG, "directed REGION-RELAY $tag (delivered by mesh relay)")
+            return
         }
-        bleToBridgeCount++
+
+        // 3. Recipient sits behind another router (learned from its crossing
+        // announce): targeted-bridge to that one router. Also hold a copy — the
+        // route may be one announce stale if the recipient just roamed.
+        val bridged = if ((packet.ttl.toInt() and 0xFF) > 0) packet.withDecrementedTTL() else packet
+        val route = freshRouteFor(recipient)
+        if (route != null) {
+            route.transport.sendToPeer(route.routerPeerID, bridged)
+            bleToBridgeCount++
+            enqueueDmForRetry(recipient, packet)
+            Log.d(TAG, "directed TARGETED $tag → ${route.transport.name}:${route.routerPeerID.rawValue.take(8)}")
+            return
+        }
+
+        // 4. No known route yet — hold and retry when the recipient's next
+        // announce reveals where it is (local, or behind some router).
+        enqueueDmForRetry(recipient, packet)
+        Log.d(TAG, "directed QUEUED $tag (awaiting route)")
+    }
+
+    // --- Region-local routing helpers ---
+
+    /**
+     * Whether a broadcast packet is allowed to cross the backbone. FRAGMENTs are
+     * judged by their inner reassembled type so a fragmented announce crosses
+     * but a fragmented public message does not.
+     */
+    private fun crossesBackbone(packet: BlemeshPacket): Boolean {
+        if (packet.type == MessageType.FRAGMENT.value) {
+            val inner = fragmentInnerType(packet) ?: return false
+            return MessageType.crossesBackboneAsBroadcast(inner)
+        }
+        return MessageType.crossesBackboneAsBroadcast(packet.type)
+    }
+
+    /**
+     * The originalType byte from a FRAGMENT payload header
+     * ([id:8][index:2][total:2][originalType:1][data]). Null if malformed.
+     */
+    private fun fragmentInnerType(packet: BlemeshPacket): Byte? =
+        if (packet.payload.size > 12) packet.payload[12] else null
+
+    /** The recipient's home router if we have a fresh, currently-connected route. */
+    private fun freshRouteFor(recipient: PeerID): RouterRoute? {
+        val route = peerToHomeRouter[recipient] ?: return null
+        if (System.currentTimeMillis() - route.lastSeenMs > HOME_ROUTER_TTL_MS) return null
+        if (route.routerPeerID !in route.transport.connectedPeerIDs()) return null
+        return route
+    }
+
+    /** Hold a directed DM for [recipient] until it becomes routable, or it ages out. */
+    private fun enqueueDmForRetry(recipient: PeerID, packet: BlemeshPacket) {
+        val now = System.currentTimeMillis()
+        val queue = dmRetryQueue.computeIfAbsent(recipient) { ArrayDeque() }
+        val size: Int
+        synchronized(queue) {
+            while (queue.isNotEmpty() && now - queue.first().enqueuedMs > DM_QUEUE_MAX_AGE_MS) {
+                queue.removeFirst()
+            }
+            if (queue.size >= DM_QUEUE_MAX_PER_PEER) queue.removeFirst()
+            queue.addLast(QueuedDm(packet, now))
+            size = queue.size
+        }
+        Log.d(TAG, "DM queued for ${recipient.rawValue.take(8)} (q=$size)")
+    }
+
+    /**
+     * Re-route the DMs held for [recipient] against the current routing state.
+     * Called when the recipient reappears locally or its home router changes
+     * (roam). If it's now directly reachable the queue is drained and cleared;
+     * otherwise each DM is re-sent (best-effort) to its current home router and
+     * held for the next update. Aged-out entries are dropped.
+     */
+    private fun flushDmQueue(recipient: PeerID) {
+        val queue = dmRetryQueue[recipient] ?: return
+        val snapshot: List<QueuedDm>
+        synchronized(queue) { snapshot = queue.toList() }
+        if (snapshot.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val localNow = bleMeshService.isLocalPeer(recipient)
+        val route = if (localNow) null else freshRouteFor(recipient)
+        var delivered = 0
+        for (entry in snapshot) {
+            if (now - entry.enqueuedMs > DM_QUEUE_MAX_AGE_MS) continue
+            val p = entry.packet
+            val hop = if ((p.ttl.toInt() and 0xFF) > 0) p.withDecrementedTTL() else p
+            when {
+                localNow -> { bleMeshService.sendPacketToAllLegs(recipient, hop); delivered++ }
+                route != null -> { route.transport.sendToPeer(route.routerPeerID, hop); bleToBridgeCount++ }
+            }
+        }
+        if (localNow) {
+            // Directly reachable now — consider the queue drained.
+            dmRetryQueue.remove(recipient)
+            Log.i(TAG, "DM flush ${recipient.rawValue.take(8)}: delivered=$delivered locally")
+        } else if (route != null) {
+            Log.i(TAG, "DM flush ${recipient.rawValue.take(8)}: re-routed ${snapshot.size} → ${route.transport.name}:${route.routerPeerID.rawValue.take(8)}")
+        }
+    }
+
+    /**
+     * Periodically expire aged-out DM-queue entries and stale home routes.
+     * Re-routing itself is event-driven (a recipient reappearing locally or a
+     * roam changing its home router), so this sweep only reaps.
+     */
+    private fun startDmSweep() {
+        dmSweepJob?.cancel()
+        dmSweepJob = serviceScope.launch {
+            while (isActive) {
+                delay(DM_SWEEP_INTERVAL_MS)
+                val now = System.currentTimeMillis()
+                val emptyKeys = mutableListOf<PeerID>()
+                for ((recipient, queue) in dmRetryQueue) {
+                    synchronized(queue) {
+                        while (queue.isNotEmpty() && now - queue.first().enqueuedMs > DM_QUEUE_MAX_AGE_MS) {
+                            queue.removeFirst()
+                        }
+                        if (queue.isEmpty()) emptyKeys += recipient
+                    }
+                }
+                for (k in emptyKeys) dmRetryQueue.remove(k)
+                peerToHomeRouter.entries.removeAll { now - it.value.lastSeenMs > HOME_ROUTER_TTL_MS }
+            }
+        }
     }
 
     private fun packetTag(packet: BlemeshPacket): String {
@@ -388,6 +556,30 @@ class MeshRouterService : Service() {
             return
         }
 
+        // Learn which router a peer sits behind from its ANNOUNCE crossing the
+        // backbone — the routing table for targeted directed bridging. On a
+        // change (first sighting or a roam to a different router) re-route any
+        // DMs we're currently holding for that peer.
+        if (packet.type == MessageType.ANNOUNCE.value || packet.type == MessageType.LOXATION_ANNOUNCE.value) {
+            PeerID.fromLongBE(packet.senderId)?.let { sender ->
+                if (sender != myPeerID) {
+                    val prev = peerToHomeRouter.put(
+                        sender, RouterRoute(fromTransport, fromRouter, System.currentTimeMillis())
+                    )
+                    if (prev == null || prev.routerPeerID != fromRouter) flushDmQueue(sender)
+                }
+            }
+        }
+
+        // Region-local rule (defensive inbound mirror): a broadcast that is not
+        // an allowed cross-backbone type came from an older peer router still
+        // bridging public messages. Drop it — don't inject it into this region
+        // or re-forward it onward.
+        if (packet.isBroadcast && !crossesBackbone(packet)) {
+            Log.d(TAG, "bridge→BLE drop BCAST-LOCAL ${packetTag(packet)} (region-local type)")
+            return
+        }
+
         // A compliant sender spends a TTL unit for the crossing, so arrival
         // at MAX_TTL means a pre-fix or non-compliant build. Clamp before
         // injection, or local reference phones bind the original sender's
@@ -403,23 +595,17 @@ class MeshRouterService : Service() {
         bleMeshService.injectPacketFromWifi(inbound)
         bridgeToBleCount++
 
-        // Multi-hop: forward to other router peers (across all transports)
-        // excluding the one we just heard it from. Each router-to-router hop
-        // spends TTL like any other hop, so bridge loops are bounded by TTL
-        // as well as by the dedup window.
-        if ((inbound.ttl.toInt() and 0xFF) <= 1) return
-        val forwarded = inbound.withDecrementedTTL()
-        val fwdTargets = mutableListOf<String>()
-        for (t in transports) {
-            for (peerID in t.connectedPeerIDs()) {
-                if (t === fromTransport && peerID == fromRouter) continue
-                t.sendToPeer(peerID, forwarded)
-                fwdTargets += "${t.name}:${peerID.rawValue.take(8)}"
-            }
-        }
-        if (fwdTargets.isNotEmpty()) {
-            Log.d(TAG, "bridge→bridge multi-hop $tag → ${fwdTargets.joinToString(",")}")
-        }
+        // No router-to-router re-forwarding. The LAN transport is a full mesh
+        // (mDNS makes every router connect to every other), so each router
+        // bridges its own region's announces directly to all peer routers and
+        // targets a directed DM straight at the recipient's home router — one
+        // hop reaches everyone. Re-forwarding would (a) re-fan-out targeted DMs,
+        // undoing the backbone saving, and (b) let a *forwarding* router look
+        // like a peer's home router (the peer→home-router map is inferred from
+        // whoever bridged the announce), mis-targeting DMs. Keeping delivery to
+        // one hop makes the map authoritative: home == the router that heard the
+        // peer over BLE. Non-full-mesh / 4+ router topologies need the
+        // routers-visited TLV (Tier-3, AUDIT.md §5) — out of scope here.
     }
 
     // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---
