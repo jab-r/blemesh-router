@@ -59,7 +59,13 @@ enum class MessageType(val value: Byte) {
     ROUTER_PONG(0x71),
     // Backbone capability advertisement (BACKBONE_PATH_ROUTING_SPEC.md): sent
     // directed to a freshly-connected router peer to negotiate path-tag support.
-    ROUTER_CAPS(0x72);
+    ROUTER_CAPS(0x72),
+    // Backbone GCS anti-entropy (router-to-router gossip). ROUTER_SYNC carries a
+    // RequestSync TLV (the sender's GCS filter of crossable content it holds);
+    // ROUTER_SYNC_DATA carries a single BinaryProtocol-encoded packet the peer
+    // was missing. Both are directed control frames, never injected into BLE.
+    ROUTER_SYNC(0x73),
+    ROUTER_SYNC_DATA(0x74);
 
     companion object {
         fun from(value: Byte): MessageType? = entries.firstOrNull { it.value == value }
@@ -103,7 +109,9 @@ enum class MessageType(val value: Byte) {
          * PROTOCOL_ACK / HANDSHAKE_REQUEST / version negotiation / WebRTC
          * signaling between reference peers.
          */
-        private val NON_BRIDGEABLE = bytes(UWB_RANGING, ROUTER_PING, ROUTER_PONG, ROUTER_CAPS)
+        private val NON_BRIDGEABLE = bytes(
+            UWB_RANGING, ROUTER_PING, ROUTER_PONG, ROUTER_CAPS, ROUTER_SYNC, ROUTER_SYNC_DATA
+        )
         fun isBridgeable(type: Byte): Boolean = type !in NON_BRIDGEABLE
 
         /**

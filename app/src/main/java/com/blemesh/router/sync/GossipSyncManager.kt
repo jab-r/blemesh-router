@@ -278,6 +278,26 @@ class GossipSyncManager(
     }
 
     private fun handleRequestSyncInternal(fromPeerID: PeerID, request: RequestSyncPacket) {
+        val missing = collectMissing(request)
+        missing.forEach { delegate?.sendPacketToPeer(fromPeerID, it) }
+        if (missing.isNotEmpty()) {
+            Log.d(TAG, "Sent ${missing.size} packets to ${fromPeerID.rawValue.take(8)} in response to REQUEST_SYNC")
+        }
+    }
+
+    /**
+     * The stored crossable packets the requester's GCS filter does NOT contain —
+     * i.e. what it's missing — each returned at ttl=0 (matching the BLE gossip
+     * reply). Pure over the packet stores (no delegate, no I/O): the BLE path
+     * calls it and forwards each result via [Delegate.sendPacketToPeer]; the
+     * router's WiFi backbone gossip calls it directly and ships each result as a
+     * ROUTER_SYNC_DATA control frame. Safe to call synchronously off-scope — the
+     * stores are @Synchronized and latestAnnouncementByPeer is concurrent.
+     *
+     * withTTL(0) is copy(ttl=0); the GCS id (PacketIdUtil) excludes ttl, so ids
+     * and downstream dedup keys are unperturbed by the reset.
+     */
+    fun collectMissing(request: RequestSyncPacket): List<BlemeshPacket> {
         val requestedTypes = request.types ?: SyncTypeFlags.PUBLIC_MESSAGES
         val sorted = GCSFilter.decodeToSortedSet(request.p, request.m, request.data)
 
@@ -286,64 +306,55 @@ class GossipSyncManager(
             return GCSFilter.contains(sorted, bucket)
         }
 
-        var sentCount = 0
+        val missing = mutableListOf<BlemeshPacket>()
 
         if (requestedTypes.contains(MessageType.ANNOUNCE)) {
             for ((_, pair) in latestAnnouncementByPeer) {
                 val (idHex, pkt) = pair
                 if (!isPacketFresh(pkt)) continue
                 val idBytes = hexToBytes(idHex)
-                if (!mightContain(idBytes)) {
-                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
-                    sentCount++
-                }
+                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
             }
         }
 
         if (requestedTypes.contains(MessageType.MESSAGE)) {
             for (pkt in messages.allPackets(::isPacketFresh)) {
                 val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) {
-                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
-                    sentCount++
-                }
+                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
             }
         }
 
         if (requestedTypes.contains(MessageType.FRAGMENT)) {
             for (pkt in fragments.allPackets(::isPacketFresh)) {
                 val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) {
-                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
-                    sentCount++
-                }
+                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
             }
         }
 
         if (requestedTypes.contains(MessageType.LOXATION_ANNOUNCE)) {
             for (pkt in loxationPackets.allPackets(::isPacketFresh)) {
                 val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) {
-                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
-                    sentCount++
-                }
+                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
             }
         }
 
         if (requestedTypes.contains(MessageType.LOCATION_UPDATE)) {
             for (pkt in locationUpdatePackets.allPackets(::isPacketFresh)) {
                 val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) {
-                    delegate?.sendPacketToPeer(fromPeerID, pkt.withTTL(0))
-                    sentCount++
-                }
+                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
             }
         }
 
-        if (sentCount > 0) {
-            Log.d(TAG, "Sent $sentCount packets to ${fromPeerID.rawValue.take(8)} in response to REQUEST_SYNC")
-        }
+        return missing
     }
+
+    /**
+     * A GCS filter (RequestSync TLV) over the crossable content this node holds
+     * for [types] — reusable by the router's WiFi backbone gossip to advertise
+     * "what I have" to a peer router. Thin, side-effect-free wrapper over the
+     * same payload builder the BLE REQUEST_SYNC path uses.
+     */
+    fun buildBackboneFilter(types: SyncTypeFlags): ByteArray = buildGcsPayload(types)
 
     private fun buildGcsPayload(types: SyncTypeFlags): ByteArray {
         val candidates = mutableListOf<BlemeshPacket>()

@@ -12,7 +12,10 @@ import com.blemesh.router.mesh.BleMeshService
 import com.blemesh.router.model.BlemeshPacket
 import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
+import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.protocol.BlemeshProtocol
+import com.blemesh.router.sync.RequestSyncPacket
+import com.blemesh.router.sync.SyncTypeFlags
 import com.blemesh.router.transport.BackboneFrame
 import com.blemesh.router.transport.LanPeerDiscovery
 import com.blemesh.router.transport.RouterTransport
@@ -86,6 +89,22 @@ class MeshRouterService : Service() {
         private const val CAPS_VERSION: Byte = 0x01
         private const val CAPS_BIT_PATH_TAG = 0x01
 
+        // --- Backbone GCS anti-entropy (router-to-router gossip) ---
+        //
+        // The crossable-content push over the WiFi backbone is a one-shot: a
+        // dropped push (loss, router restart, a router that connects after the
+        // push) is never recovered until the origin's next periodic emission,
+        // because BLE gossip (REQUEST_SYNC) is region-local and a ttl=0 RSR is
+        // dropped at the bridge. This adds bidirectional GCS anti-entropy over
+        // the backbone so crossable content reconciles: each router periodically
+        // (and on connect) advertises a GCS filter of what it holds; the peer
+        // replies with the packets it's missing, which re-seed the store only
+        // (the local BLE crowd then pulls them via existing local gossip). It
+        // composes with the push (push = latency, gossip = reliable backfill);
+        // the mesh dedup prevents double-processing. Mirrors BACKBONE_PATH_TAG.
+        private const val BACKBONE_GOSSIP = true
+        private const val BACKBONE_GOSSIP_INTERVAL_MS = 20_000L
+
         const val EXTRA_WIFI_PORT = "wifi_port"
         const val EXTRA_CONNECT_TO = "connect_to" // comma-separated "host:port" list
 
@@ -123,6 +142,14 @@ class MeshRouterService : Service() {
     // (transport name, peerID) -> last measured RTT in ms.
     private val rttByTransportPeer = ConcurrentHashMap<Pair<String, PeerID>, Long>()
     private var rttJob: Job? = null
+
+    // Backbone gossip: the crossable broadcast content reconciled over the WiFi
+    // backbone (presence + location). Mirrors CROSSES_BACKBONE minus LEAVE (no
+    // gossip store) and FRAGMENT (cross-backbone reassembly out of scope).
+    private val CROSSABLE_SYNC_TYPES = SyncTypeFlags.fromTypes(
+        MessageType.ANNOUNCE, MessageType.LOXATION_ANNOUNCE, MessageType.LOCATION_UPDATE
+    )
+    private var backboneGossipJob: Job? = null
 
     // Counts distinct originations of (sender, recipient, type) within a sliding
     // window. Each NOISE_HANDSHAKE retransmission carries a fresh timestamp so it
@@ -213,6 +240,7 @@ class MeshRouterService : Service() {
 
         startRttProbing()
         startDmSweep()
+        if (BACKBONE_GOSSIP) startBackboneGossip()
 
         Log.i(TAG, "Router started with ${transports.size} transport(s)")
         return START_STICKY
@@ -224,6 +252,8 @@ class MeshRouterService : Service() {
         rttJob = null
         dmSweepJob?.cancel()
         dmSweepJob = null
+        backboneGossipJob?.cancel()
+        backboneGossipJob = null
         outstandingPings.clear()
         rttByTransportPeer.clear()
         peerToHomeRouter.clear()
@@ -603,6 +633,10 @@ class MeshRouterService : Service() {
             // send us tagged frames (and we learn the same from its reply).
             // Until the caps round-trip completes both sides use plain frames.
             if (BACKBONE_PATH_TAG) sendRouterCaps(transport, peer)
+            // Kick an immediate anti-entropy round so a router that connects
+            // after the origin's push still reconciles crossable content fast,
+            // without waiting for the periodic interval.
+            if (BACKBONE_GOSSIP) sendRouterSync(transport, peer)
         }
 
         override fun onTransportPeerDisconnected(transport: RouterTransport, peer: PeerID) {
@@ -637,6 +671,14 @@ class MeshRouterService : Service() {
             }
             MessageType.ROUTER_CAPS.value -> {
                 handleRouterCaps(fromTransport, packet, fromRouter)
+                return
+            }
+            MessageType.ROUTER_SYNC.value -> {
+                handleRouterSync(fromTransport, packet, fromRouter)
+                return
+            }
+            MessageType.ROUTER_SYNC_DATA.value -> {
+                handleRouterSyncData(fromTransport, packet, fromRouter)
                 return
             }
         }
@@ -775,6 +817,91 @@ class MeshRouterService : Service() {
             (packet.payload[1].toInt() and CAPS_BIT_PATH_TAG) != 0
         fromTransport.setPeerBackboneTag(fromRouter, supportsTag)
         Log.d(TAG, "ROUTER_CAPS from ${fromRouter.rawValue.take(8)} via ${fromTransport.name}: pathTag=$supportsTag")
+    }
+
+    // --- Backbone GCS anti-entropy (ROUTER_SYNC / ROUTER_SYNC_DATA) ---
+
+    /**
+     * Periodically advertise our crossable-content GCS filter to every connected
+     * router peer over every transport. All peers each round (the router count is
+     * small, so reconciliation reliability beats BLE's maxPeersPerSync frugality).
+     */
+    private fun startBackboneGossip() {
+        backboneGossipJob?.cancel()
+        backboneGossipJob = serviceScope.launch {
+            while (isActive) {
+                delay(BACKBONE_GOSSIP_INTERVAL_MS)
+                for (t in transports) {
+                    for (peer in t.connectedPeerIDs()) {
+                        sendRouterSync(t, peer)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Advertise "what crossable content I hold" to [peer] as a directed
+     * ROUTER_SYNC control frame (payload = RequestSync TLV / GCS filter). The
+     * peer replies with ROUTER_SYNC_DATA for anything we're missing.
+     */
+    private fun sendRouterSync(transport: RouterTransport, peer: PeerID) {
+        val payload = bleMeshService.gossipSyncManager.buildBackboneFilter(CROSSABLE_SYNC_TYPES)
+        val packet = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ROUTER_SYNC.value,
+            ttl = 1.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
+            senderId = myPeerID.toLongBE(),
+            recipientId = peer.toLongBE(),
+            payload = payload,
+            signature = null
+        )
+        // Plain frame — this is router-internal control traffic, never tagged.
+        transport.sendToPeer(peer, packet, emptyList())
+    }
+
+    /**
+     * A peer advertised its filter: reply with each crossable packet it lacks as
+     * a ROUTER_SYNC_DATA control frame. collectMissing is pure over the gossip
+     * stores (thread-safe to call synchronously here).
+     */
+    private fun handleRouterSync(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
+        val req = RequestSyncPacket.decode(packet.payload) ?: return
+        val missing = bleMeshService.gossipSyncManager.collectMissing(req)
+        for (pkt in missing) sendRouterSyncData(fromTransport, fromRouter, pkt)
+        if (missing.isNotEmpty()) {
+            Log.d(TAG, "ROUTER_SYNC from ${fromRouter.rawValue.take(8)}: replying ${missing.size} packet(s)")
+        }
+    }
+
+    /** Ship one crossable packet the peer was missing as a directed control frame. */
+    private fun sendRouterSyncData(transport: RouterTransport, peer: PeerID, inner: BlemeshPacket) {
+        val encoded = BinaryProtocol.encode(inner) ?: return
+        val packet = BlemeshPacket(
+            version = BlemeshPacket.PROTOCOL_VERSION,
+            type = MessageType.ROUTER_SYNC_DATA.value,
+            ttl = 1.toByte(),
+            timestamp = System.currentTimeMillis(),
+            flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
+            senderId = myPeerID.toLongBE(),
+            recipientId = peer.toLongBE(),
+            payload = encoded,
+            signature = null
+        )
+        transport.sendToPeer(peer, packet, emptyList())
+    }
+
+    /**
+     * A peer sent us content we were missing: re-seed our gossip store ONLY (no
+     * BLE inject, no re-forward, no home-router learning). Our local BLE crowd
+     * then pulls it via the existing local gossip — backfill, not a re-flood.
+     */
+    private fun handleRouterSyncData(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
+        val inner = BinaryProtocol.decode(packet.payload) ?: return
+        bleMeshService.gossipSyncManager.onPublicPacketSeen(inner)
+        Log.d(TAG, "ROUTER_SYNC_DATA from ${fromRouter.rawValue.take(8)}: re-seeded ${packetTag(inner)}")
     }
 
     // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---
