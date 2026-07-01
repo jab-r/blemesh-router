@@ -94,6 +94,13 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
+
+    testOptions {
+        // Return defaults (0/null/false) for un-mocked Android framework calls
+        // (e.g. android.util.Log) so pure-JVM unit tests don't throw
+        // "Method not mocked" when exercising main-source classes that log.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {

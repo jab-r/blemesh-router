@@ -431,6 +431,21 @@ class BleMeshService(
         return System.currentTimeMillis() - lastSeen <= REGION_MEMBER_TTL_MS
     }
 
+    /**
+     * Snapshot of the peers currently in this router's BLE region, each with how
+     * long ago (ms) its last BLE-origin packet was seen. Only genuine BLE-origin
+     * peers appear (WiFi-injected packets never stamp [regionMembers]), which is
+     * exactly the set this router can authoritatively act as home router for —
+     * used to advertise home-router routes over the backbone (ROUTER_HOME).
+     */
+    fun getRegionMembers(): List<Pair<PeerID, Long>> {
+        val now = System.currentTimeMillis()
+        return regionMembers.entries.mapNotNull { (peerID, lastSeen) ->
+            val age = now - lastSeen
+            if (age <= REGION_MEMBER_TTL_MS) peerID to age else null
+        }
+    }
+
     /** Last observed RSSI for a connected BLE peer, or null if unknown. */
     fun getPeerRssi(peerID: PeerID): Int? {
         val address = peerIdToAddress[peerID] ?: return null
@@ -917,10 +932,12 @@ class BleMeshService(
         val packetId = buildDeduplicationKey(packet)
         if (deduplicator.isDuplicate(packetId)) return
 
-        // Region membership: this packet genuinely originated over BLE (it
-        // passed dedup, so it is not a WiFi-injected packet echoed back — those
-        // were already recorded by injectPacketFromWifi). Its sender is
-        // reachable inside our local BLE region. Stamp last-seen.
+        // Region membership: stamp last-seen ONLY for packets that genuinely
+        // originated over BLE. This is the single writer of regionMembers —
+        // injectPacketFromWifi deliberately never stamps it, so a WiFi-injected
+        // peer is never mistaken for a local-region member. That invariant is
+        // load-bearing for ROUTER_HOME: we only advertise ourselves as home
+        // router for peers actually reachable inside our BLE region.
         PeerID.fromLongBE(packet.senderId)?.let { regionMembers[it] = System.currentTimeMillis() }
 
         val messageType = MessageType.from(packet.type)
