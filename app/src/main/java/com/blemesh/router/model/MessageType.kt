@@ -62,8 +62,10 @@ enum class MessageType(val value: Byte) {
     ROUTER_CAPS(0x72),
     // Backbone GCS anti-entropy (router-to-router gossip). ROUTER_SYNC carries a
     // RequestSync TLV (the sender's GCS filter of crossable content it holds);
-    // ROUTER_SYNC_DATA carries a single BinaryProtocol-encoded packet the peer
-    // was missing. Both are directed control frames, never injected into BLE.
+    // ROUTER_SYNC_DATA carries one packet the peer was missing, framed with an
+    // optional origin-router claim (RouterSyncDataFrame) so a re-seeded announce
+    // can also rebuild the receiver's peer→home-router map for reliable DMs.
+    // Both are directed control frames, never injected into BLE.
     ROUTER_SYNC(0x73),
     ROUTER_SYNC_DATA(0x74);
 

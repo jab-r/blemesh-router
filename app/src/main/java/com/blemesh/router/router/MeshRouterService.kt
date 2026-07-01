@@ -866,19 +866,46 @@ class MeshRouterService : Service() {
      * A peer advertised its filter: reply with each crossable packet it lacks as
      * a ROUTER_SYNC_DATA control frame. collectMissing is pure over the gossip
      * stores (thread-safe to call synchronously here).
+     *
+     * For each reply we stamp an origin-router claim IFF the packet's sender is
+     * in our own BLE region (isRegionMember) — i.e. we are that sender's home
+     * router and can deliver its DMs. That lets the receiver rebuild its
+     * peer→home-router map from a re-seeded announce even when the real-time
+     * announce push was lost (the DM-reliability gap). A packet for a sender not
+     * in our region is sent content-only (no claim we can't back).
      */
     private fun handleRouterSync(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
         val req = RequestSyncPacket.decode(packet.payload) ?: return
         val missing = bleMeshService.gossipSyncManager.collectMissing(req)
-        for (pkt in missing) sendRouterSyncData(fromTransport, fromRouter, pkt)
+        for (pkt in missing) {
+            // Stamp a home-router claim only for presence/announce types and only
+            // when the sender is in our region — the exact policy the push path
+            // uses to learn peer→home-router (:686). LOCATION_UPDATE re-seeds as
+            // content-only (it is not a home-router learning signal on either path).
+            val sender = PeerID.fromLongBE(pkt.senderId)
+            val isAnnounce = pkt.type == MessageType.ANNOUNCE.value ||
+                pkt.type == MessageType.LOXATION_ANNOUNCE.value
+            val origin = if (isAnnounce && sender != null && bleMeshService.isRegionMember(sender)) {
+                myPeerID
+            } else null
+            sendRouterSyncData(fromTransport, fromRouter, pkt, origin)
+        }
         if (missing.isNotEmpty()) {
             Log.d(TAG, "ROUTER_SYNC from ${fromRouter.rawValue.take(8)}: replying ${missing.size} packet(s)")
         }
     }
 
-    /** Ship one crossable packet the peer was missing as a directed control frame. */
-    private fun sendRouterSyncData(transport: RouterTransport, peer: PeerID, inner: BlemeshPacket) {
-        val encoded = BinaryProtocol.encode(inner) ?: return
+    /**
+     * Ship one crossable packet the peer was missing as a directed control frame,
+     * framed with an optional [origin] home-router claim (RouterSyncDataFrame).
+     */
+    private fun sendRouterSyncData(
+        transport: RouterTransport,
+        peer: PeerID,
+        inner: BlemeshPacket,
+        origin: PeerID?
+    ) {
+        val encodedInner = BinaryProtocol.encode(inner) ?: return
         val packet = BlemeshPacket(
             version = BlemeshPacket.PROTOCOL_VERSION,
             type = MessageType.ROUTER_SYNC_DATA.value,
@@ -887,21 +914,47 @@ class MeshRouterService : Service() {
             flags = BlemeshPacket.FLAG_HAS_RECIPIENT,
             senderId = myPeerID.toLongBE(),
             recipientId = peer.toLongBE(),
-            payload = encoded,
+            payload = RouterSyncDataFrame.encode(origin, encodedInner),
             signature = null
         )
         transport.sendToPeer(peer, packet, emptyList())
     }
 
     /**
-     * A peer sent us content we were missing: re-seed our gossip store ONLY (no
-     * BLE inject, no re-forward, no home-router learning). Our local BLE crowd
-     * then pulls it via the existing local gossip — backfill, not a re-flood.
+     * A peer sent us content we were missing. Two effects:
+     *
+     * 1. Re-seed our gossip store (onPublicPacketSeen) — no BLE inject, no
+     *    re-forward. Our local BLE crowd pulls it via existing local gossip.
+     * 2. If the frame carries an origin-router claim we can trust — the claim is
+     *    a self-claim (origin == the router that sent us this frame), so we both
+     *    trust it (only the home router stamps it) and can reach it (we're
+     *    directly connected to fromRouter) — update peer→home-router and flush
+     *    any DMs we were holding for that sender. This closes the DM-routability
+     *    gap when the sender's announce push was lost: gossip now teaches the
+     *    route, not just the content. Mirrors the push-path learning at :686.
+     *
+     * A relayed (non-self) origin claim is deliberately ignored: we can neither
+     * verify it nor guarantee a path to that third router, and peer→home-router
+     * has no next-hop concept. Such a packet still re-seeds as content.
      */
     private fun handleRouterSyncData(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
-        val inner = BinaryProtocol.decode(packet.payload) ?: return
+        val frame = RouterSyncDataFrame.decode(packet.payload) ?: return
+        val inner = BinaryProtocol.decode(frame.encodedPacket) ?: return
         bleMeshService.gossipSyncManager.onPublicPacketSeen(inner)
         Log.d(TAG, "ROUTER_SYNC_DATA from ${fromRouter.rawValue.take(8)}: re-seeded ${packetTag(inner)}")
+
+        // Home-router learning under the trust guard (self-claim only).
+        if (frame.originRouter == fromRouter) {
+            PeerID.fromLongBE(inner.senderId)?.let { sender ->
+                if (sender != myPeerID && sender != fromRouter) {
+                    val prev = peerToHomeRouter.put(
+                        sender, RouterRoute(fromTransport, fromRouter, System.currentTimeMillis())
+                    )
+                    if (prev == null || prev.routerPeerID != fromRouter) flushDmQueue(sender)
+                    Log.d(TAG, "ROUTER_SYNC_DATA learned home ${sender.rawValue.take(8)} → ${fromRouter.rawValue.take(8)}")
+                }
+            }
+        }
     }
 
     // --- Router-to-router RTT (ROUTER_PING / ROUTER_PONG) ---
