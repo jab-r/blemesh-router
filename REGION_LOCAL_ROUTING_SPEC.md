@@ -1,7 +1,11 @@
 # Region-Local Routing — keep local traffic off the WiFi backbone
 
-**Status: DESIGN — for team review. No code has landed.**
-2026-06-30. Companions: `AUDIT.md` (§4.3 backbone loop avoidance), `NODETYPE_RELAY_ONLY_SPEC.md`,
+**Status: IMPLEMENTED (2026-06-30, commit `324d75b` "Implement beacon mode and region-local routing").**
+Broadcast gate + `CROSSES_BACKBONE` allowlist + directed region-relay/targeted-bridge live in
+`MeshRouterService.kt` / `MessageType.kt`; region membership in `BleMeshService.kt` (`regionMembers`,
+90s TTL). This header previously said "DESIGN — no code has landed" — stale (audit 2026-07-01).
+2026-06-30. Companions: `AUDIT.md` (§4.3 backbone loop avoidance — itself superseded by the shipped
+Tier-3 path tag, commit `ec689e0`; the audit predates it), `NODETYPE_RELAY_ONLY_SPEC.md`,
 `docs/beacon-mode.md`. Parent roadmap: `loxation-sw/docs/festival-scale-mesh-scaling.md` (Tier 2).
 
 The core spec (§1-§6) is **router-only** — the loxation clients (`loxation-sw`, `loxation-android`)

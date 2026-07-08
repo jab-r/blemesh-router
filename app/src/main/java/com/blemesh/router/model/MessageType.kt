@@ -179,5 +179,19 @@ enum class MessageType(val value: Byte) {
          */
         private val RETRY_TRACKING_EXEMPT = bytes(ANNOUNCE, FRAGMENT)
         fun isRetryTracked(type: Byte): Boolean = type !in RETRY_TRACKING_EXEMPT
+
+        /**
+         * Router-internal frames carried on the transports' small
+         * high-priority send lane, so a bulk gossip burst (ROUTER_SYNC_DATA)
+         * can neither delay nor evict them: a ping/pong queued behind
+         * hundreds of sync frames trips the liveness reaper on a healthy
+         * link, and a dropped ROUTER_CAPS silently downgrades path-tag
+         * negotiation for the life of the connection. ROUTER_SYNC_DATA is
+         * deliberately NOT here — it IS the burst, and a dropped backfill
+         * frame reconciles on the next anti-entropy round.
+         * Unknown codes: bulk lane.
+         */
+        private val CONTROL_LANE = bytes(ROUTER_PING, ROUTER_PONG, ROUTER_CAPS, ROUTER_SYNC, ROUTER_HOME)
+        fun isControlLane(type: Byte): Boolean = type in CONTROL_LANE
     }
 }

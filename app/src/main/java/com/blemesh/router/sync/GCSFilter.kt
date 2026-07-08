@@ -46,6 +46,9 @@ object GCSFilter {
         val p = deriveP(targetFpr)
         val nCap = estimateMaxElementsForSize(maxBytes, p)
         val n = ids.size.coerceAtMost(nCap)
+        // Empty input must still be wire-valid: m = 0 is rejected by
+        // RequestSyncPacket.decode, so use the reference's m = 1 empty filter.
+        if (n == 0) return Params(p = p, m = 1L, data = ByteArray(0))
         val selected = ids.take(n)
         val m = (n.toLong() shl p)
         // Normalize like iOS GCSFilter: remap bucket 0 to 1 and drop duplicate

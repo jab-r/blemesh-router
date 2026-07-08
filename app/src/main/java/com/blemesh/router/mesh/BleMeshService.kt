@@ -281,9 +281,13 @@ class BleMeshService(
         if (peerIdToAddress.containsKey(recipient)) return // currently reachable; broadcast will deliver
 
         val now = System.currentTimeMillis()
-        val queue = pendingByPeer.computeIfAbsent(recipient) { ArrayDeque() }
-        val size: Int
-        synchronized(queue) {
+        var size = 0
+        // All pendingByPeer deque access (here, flush, sweep) happens inside
+        // compute/computeIfPresent — the map's per-key lock — so a concurrent
+        // remove can never detach a deque between lookup and add and strand
+        // the packet.
+        pendingByPeer.compute(recipient) { _, existing ->
+            val queue = existing ?: ArrayDeque()
             // Drop aged-out entries while we're touching it.
             while (queue.isNotEmpty() && now - queue.first().enqueuedAtMs > SNF_MAX_AGE_MS) {
                 queue.removeFirst()
@@ -291,6 +295,7 @@ class BleMeshService(
             if (queue.size >= SNF_MAX_PER_PEER) queue.removeFirst()
             queue.addLast(PendingPacket(packet, now))
             size = queue.size
+            queue
         }
         Log.d(TAG, "S&F buffer type=0x${"%02x".format(packet.type.toInt() and 0xFF)} for ${recipient.rawValue.take(8)} (q=$size)")
     }
@@ -300,12 +305,15 @@ class BleMeshService(
      * the now-live BLE address. Drops aged entries. No-op if nothing pending.
      */
     private fun flushPendingFor(peerID: PeerID) {
-        val queue = pendingByPeer.remove(peerID) ?: return
-        val snapshot: List<PendingPacket>
-        synchronized(queue) {
-            snapshot = queue.toList()
-            queue.clear()
+        // Drain and detach atomically under the map's per-key lock: a buffer
+        // add landing after this snapshot goes into a fresh, still-mapped
+        // deque instead of one already detached from the map.
+        val snapshot = ArrayList<PendingPacket>()
+        pendingByPeer.computeIfPresent(peerID) { _, queue ->
+            snapshot.addAll(queue)
+            null
         }
+        if (snapshot.isEmpty()) return
         val now = System.currentTimeMillis()
         // Replay off the GATT binder thread: serialized writes pace at ~8ms
         // per frame, and a full ring would stall callback delivery otherwise.
@@ -332,16 +340,17 @@ class BleMeshService(
             while (isActive && isRunning) {
                 delay(SNF_SWEEP_INTERVAL_MS)
                 val now = System.currentTimeMillis()
-                val emptyKeys = mutableListOf<PeerID>()
-                for ((peerID, queue) in pendingByPeer) {
-                    synchronized(queue) {
+                // Expire and (if emptied) unmap each deque in one per-key
+                // atomic step, so a concurrent buffer add can't land in a
+                // deque this sweep is about to detach.
+                for (peerID in pendingByPeer.keys) {
+                    pendingByPeer.computeIfPresent(peerID) { _, queue ->
                         while (queue.isNotEmpty() && now - queue.first().enqueuedAtMs > SNF_MAX_AGE_MS) {
                             queue.removeFirst()
                         }
-                        if (queue.isEmpty()) emptyKeys += peerID
+                        if (queue.isEmpty()) null else queue
                     }
                 }
-                for (k in emptyKeys) pendingByPeer.remove(k)
 
                 // Age out region members not heard from within the TTL.
                 regionMembers.entries.removeAll { now - it.value > REGION_MEMBER_TTL_MS }

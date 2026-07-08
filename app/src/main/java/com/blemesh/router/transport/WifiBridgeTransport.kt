@@ -2,6 +2,7 @@ package com.blemesh.router.transport
 
 import android.util.Log
 import com.blemesh.router.model.BlemeshPacket
+import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
 import kotlinx.coroutines.*
@@ -35,9 +36,15 @@ class WifiBridgeTransport(
     companion object {
         private const val TAG = "WifiBridgeTransport"
         const val DEFAULT_PORT = 9742
-        private const val MAX_PACKET_SIZE = 65536
+        // Frame size bounds and send-queue sizing live in LinkWriter, shared
+        // by all three backbone transports so they can't drift apart.
         private const val HANDSHAKE_VERSION: Byte = 0x01
         private const val HANDSHAKE_TIMEOUT_MS = 5000
+        // Read-idle liveness bound. RTT pings flow every 5s on a healthy link,
+        // so a read that sits idle this long means the peer is gone without a
+        // FIN (radio loss). SO_TIMEOUT=0 (the old behavior) kept half-open
+        // connections in the routing table indefinitely, black-holing traffic.
+        private const val READ_IDLE_TIMEOUT_MS = 45_000
         private const val INITIAL_RECONNECT_DELAY_MS = 5_000L
         private const val MAX_RECONNECT_DELAY_MS = 300_000L
     }
@@ -54,14 +61,20 @@ class WifiBridgeTransport(
     private var serverJob: Job? = null
     private var isRunning = false
 
-    private data class RouterConnection(
+    private class RouterConnection(
         val peerID: PeerID,
         val socket: Socket,
         val output: DataOutputStream,
         val input: DataInputStream,
-        val isOutbound: Boolean,
+        val isOutbound: Boolean
+    ) {
         var readJob: Job? = null
-    )
+        var writeJob: Job? = null
+        // Two-lane bounded send queue + single writer (shared helper): control
+        // frames (ping/pong/caps/sync adverts) can't be starved or evicted by
+        // bulk gossip bursts, and bulk overflow drops-oldest with logging.
+        val writer = LinkWriter("tcp:${peerID.rawValue.take(8)}")
+    }
 
     // --- RouterTransport ---
 
@@ -96,7 +109,7 @@ class WifiBridgeTransport(
             val aware = peerID in tagAwarePeers
             if (taggedPeersOnly && !aware) continue // forwarded frames: tag-aware peers only
             val body = if (visited.isNotEmpty() && aware) tagged else plain
-            sendRaw(conn, body)
+            conn.writer.enqueue(body, controlLane = false)
         }
     }
 
@@ -106,7 +119,7 @@ class WifiBridgeTransport(
         val body = if (visited.isNotEmpty() && peerID in tagAwarePeers) {
             BackboneFrame.encode(visited, plain)
         } else plain
-        sendRaw(conn, body)
+        conn.writer.enqueue(body, MessageType.isControlLane(packet.type))
     }
 
     override fun connectedPeerIDs(): List<PeerID> = connections.keys.toList()
@@ -182,7 +195,7 @@ class WifiBridgeTransport(
             try { socket.close() } catch (_: Exception) { }
             return false
         }
-        try { socket.soTimeout = 0 } catch (_: Exception) { }
+        try { socket.soTimeout = READ_IDLE_TIMEOUT_MS } catch (_: Exception) { }
 
         // registerConnection either accepts this socket (returns its readJob)
         // or rejects it on dedup (returns the kept connection's readJob, if any).
@@ -227,7 +240,7 @@ class WifiBridgeTransport(
                     try { socket.close() } catch (_: Exception) { }
                     return@launch
                 }
-                socket.soTimeout = 0
+                socket.soTimeout = READ_IDLE_TIMEOUT_MS
                 registerConnection(remotePeer, socket, output, input, isOutbound = false)
             } catch (e: Exception) {
                 Log.w(TAG, "Inbound connection from $remoteAddr failed: ${e.message}")
@@ -306,24 +319,29 @@ class WifiBridgeTransport(
                 // fire onTransportPeerDisconnected -- the new conn replaces it.
                 connections.remove(remotePeer)
                 existing.readJob?.cancel()
+                existing.writer.close()
+                existing.writeJob?.cancel()
                 try { existing.socket.close() } catch (_: Exception) { }
             }
 
             val conn = RouterConnection(remotePeer, socket, output, input, isOutbound)
             connections[remotePeer] = conn
             conn.readJob = startReading(conn)
+            conn.writeJob = startWriting(conn)
             listener?.onTransportPeerConnected(this, remotePeer)
             Log.i(TAG, "Connected to router peer ${remotePeer.rawValue.take(8)} (${if (isOutbound) "outbound" else "inbound"})")
             return conn.readJob
         }
     }
 
-    private fun disconnectPeer(peerID: PeerID) {
+    override fun disconnectPeer(peerID: PeerID) {
         val conn: RouterConnection
         synchronized(connections) {
             conn = connections.remove(peerID) ?: return
         }
         conn.readJob?.cancel()
+        conn.writer.close()
+        conn.writeJob?.cancel()
         try { conn.socket.close() } catch (_: Exception) { }
         tagAwarePeers.remove(peerID)
         listener?.onTransportPeerDisconnected(this, peerID)
@@ -341,6 +359,8 @@ class WifiBridgeTransport(
             wasActive = connections[conn.peerID] === conn
             if (wasActive) connections.remove(conn.peerID)
         }
+        conn.writer.close()
+        conn.writeJob?.cancel()
         try { conn.socket.close() } catch (_: Exception) { }
         if (wasActive) {
             tagAwarePeers.remove(conn.peerID)
@@ -355,7 +375,7 @@ class WifiBridgeTransport(
             try {
                 while (isActive && isRunning && !conn.socket.isClosed) {
                     val length = conn.input.readInt()
-                    if (length <= 0 || length > MAX_PACKET_SIZE) {
+                    if (length <= 0 || length > LinkWriter.MAX_RECEIVE_FRAME) {
                         Log.w(TAG, "Invalid frame length $length from ${conn.peerID.rawValue.take(8)}")
                         break
                     }
@@ -370,6 +390,8 @@ class WifiBridgeTransport(
                         listener?.onTransportPacketReceived(this@WifiBridgeTransport, packet, conn.peerID, visited)
                     }
                 }
+            } catch (e: java.net.SocketTimeoutException) {
+                if (isRunning) Log.w(TAG, "Read idle >${READ_IDLE_TIMEOUT_MS}ms from ${conn.peerID.rawValue.take(8)}; presuming dead link")
             } catch (e: Exception) {
                 if (isRunning) Log.d(TAG, "Read loop ended for ${conn.peerID.rawValue.take(8)}: ${e.message}")
             } finally {
@@ -380,18 +402,15 @@ class WifiBridgeTransport(
 
     // --- Write ---
 
-    private fun sendRaw(conn: RouterConnection, data: ByteArray) {
-        scope.launch(Dispatchers.IO) {
-            try {
-                synchronized(conn.output) {
-                    conn.output.writeInt(data.size)
-                    conn.output.write(data)
-                    conn.output.flush()
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Send to ${conn.peerID.rawValue.take(8)} failed: ${e.message}")
-                disconnectConnection(conn)
-            }
+    /**
+     * Single writer per connection, draining [RouterConnection.writer].
+     * Frames to a peer stay FIFO per lane, and a peer with a full TCP window
+     * blocks exactly one IO thread instead of one per queued frame. Exits
+     * when the writer is closed (disconnect) or a write fails.
+     */
+    private fun startWriting(conn: RouterConnection): Job =
+        conn.writer.startWriter(scope, conn.output) { e ->
+            Log.w(TAG, "Send to ${conn.peerID.rawValue.take(8)} failed: ${e.message}")
+            disconnectConnection(conn)
         }
-    }
 }

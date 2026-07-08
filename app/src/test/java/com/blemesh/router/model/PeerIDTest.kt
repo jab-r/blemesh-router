@@ -24,13 +24,22 @@ class PeerIDTest {
     }
 
     @Test
+    fun fromHexString_rejectsNonHex() {
+        // isLetterOrDigit()-style validation admitted g–z and Unicode letters;
+        // such an id has a null toBytes() and silently aliases to peer 0 via
+        // toLongBE(). Strictly hex only.
+        assertNull(PeerID.fromHexString("zzzzzzzzzzzzzzzz"))
+        assertNull(PeerID.fromHexString("0123456789abcdeg"))
+        assertNotNull(PeerID.fromHexString("0123456789abcdef"))
+        assertNotNull(PeerID.fromHexString("0123 4567 89AB CDEF")) // spaces + case normalized
+    }
+
+    @Test
     fun toBytes_returnsNullForNonHexPeerId() {
-        // fromHexString accepts any letter/digit, so a 16-char non-hex id is
+        // The primary constructor is public, so a 16-char non-hex id is still
         // representable. toBytes must reject it wholesale, NOT yield a short
         // array (which would crash BackboneFrame.encode's fixed-length copy).
-        val peer = PeerID.fromHexString("zzzzzzzzzzzzzzzz")
-        assertNotNull(peer)
-        assertNull(peer!!.toBytes())
+        assertNull(PeerID("zzzzzzzzzzzzzzzz").toBytes())
     }
 
     @Test

@@ -1,8 +1,11 @@
 package com.blemesh.router.mesh
 
+import android.util.Log
 import java.security.SecureRandom
 import kotlin.math.ceil
 import kotlin.math.min
+
+private const val TAG = "BleMeshFragmentation"
 
 /**
  * Fragmentation helper for BLE mesh.
@@ -86,6 +89,12 @@ class BleMeshFragmentationManager {
         private val pending = HashMap<String, PendingTransfer>()
         private val timeoutMs = 30_000L // 30 second timeout
         private val maxTransfers = 128
+        // Sanity ceiling on the wire-supplied 2-byte `total`: the largest legal
+        // encoded packet is ~65.7 KB and practical fragment slices are hundreds
+        // of bytes, so a genuine transfer never approaches this. Without it a
+        // single fragment claiming total=65535 allocates a 65535-slot array per
+        // transfer, held for the 30s timeout (~tens of MB across the 128 cap).
+        private val maxTotalFragments = 8192
 
         /**
          * Add a fragment and return the reassembled data if all fragments received.
@@ -105,6 +114,14 @@ class BleMeshFragmentationManager {
             data: ByteArray
         ): ByteArray? {
             if (total <= 0 || index < 0 || index >= total) return null
+            if (total > maxTotalFragments) {
+                // Wire-legal (Total is a full u16) but beyond the sanity
+                // ceiling. Reject loudly, not silently: a legitimate sender
+                // hitting this is mis-fragmenting (sub-9-byte slices), and a
+                // silent null here reads as plain packet loss in the field.
+                Log.w(TAG, "Rejecting fragment transfer: total=$total exceeds cap=$maxTotalFragments (sender=${"%016x".format(senderId)})")
+                return null
+            }
 
             // Sweep expired transfers on every insert (references sweep per
             // fragment / on a timer); the map is capped at 128 so this is cheap.

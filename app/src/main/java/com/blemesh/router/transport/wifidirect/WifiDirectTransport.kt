@@ -12,9 +12,11 @@ import android.net.wifi.p2p.WifiP2pInfo
 import android.net.wifi.p2p.WifiP2pManager
 import android.util.Log
 import com.blemesh.router.model.BlemeshPacket
+import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.transport.BackboneFrame
+import com.blemesh.router.transport.LinkWriter
 import com.blemesh.router.transport.RouterTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +27,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -81,6 +82,11 @@ class WifiDirectTransport(
         val socket: Socket
     ) {
         @Volatile var readJob: Job? = null
+        @Volatile var writeJob: Job? = null
+        // Two-lane bounded send queue + single writer (shared helper): control
+        // frames (ping/pong/caps/sync adverts) can't be starved or evicted by
+        // bulk gossip bursts, and bulk overflow drops-oldest with logging.
+        val writer = LinkWriter("direct:${peerID.rawValue.take(8)}")
     }
 
     private val peers = ConcurrentHashMap<PeerID, PeerLink>()
@@ -89,6 +95,12 @@ class WifiDirectTransport(
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var serverAcceptJob: Job? = null
     @Volatile private var connectionInProgress: Boolean = false
+    // Backstop for connectionInProgress: m.connect can report onSuccess yet the
+    // P2P group never forms, in which case no CONNECTION_CHANGED(groupFormed)
+    // broadcast ever arrives and none of the normal clear points fire — the
+    // flag would stay true forever and handlePeersChanged would skip every
+    // future attempt until service restart.
+    @Volatile private var connectAttemptTimeout: Job? = null
 
     // --- RouterTransport ---
 
@@ -129,7 +141,7 @@ class WifiDirectTransport(
             val aware = peerID in tagAwarePeers
             if (taggedPeersOnly && !aware) continue // forwarded frames: tag-aware peers only
             val body = if (visited.isNotEmpty() && aware) tagged else plain
-            writeFramed(link, body)
+            link.writer.enqueue(body, controlLane = false)
         }
     }
 
@@ -139,10 +151,15 @@ class WifiDirectTransport(
         val body = if (visited.isNotEmpty() && peerID in tagAwarePeers) {
             BackboneFrame.encode(visited, plain)
         } else plain
-        writeFramed(link, body)
+        link.writer.enqueue(body, MessageType.isControlLane(packet.type))
     }
 
     override fun connectedPeerIDs(): List<PeerID> = peers.keys.toList()
+
+    override fun disconnectPeer(peerID: PeerID) {
+        val link = peers[peerID] ?: return
+        tearDownLink(link)
+    }
 
     override fun setPeerBackboneTag(peerID: PeerID, supported: Boolean) {
         if (supported) tagAwarePeers.add(peerID) else tagAwarePeers.remove(peerID)
@@ -203,7 +220,7 @@ class WifiDirectTransport(
         try {
             m.requestPeers(ch) { list ->
                 val candidate = pickPeer(list.deviceList.toList()) ?: return@requestPeers
-                connectionInProgress = true
+                beginConnectionAttempt()
                 val cfg = WifiP2pConfig().apply {
                     deviceAddress = candidate.deviceAddress
                 }
@@ -211,11 +228,30 @@ class WifiDirectTransport(
                     override fun onSuccess() {}
                     override fun onFailure(reason: Int) {
                         Log.w(TAG, "P2P connect failed: $reason")
-                        connectionInProgress = false
+                        endConnectionAttempt()
                     }
                 })
             }
-        } catch (_: Exception) { connectionInProgress = false }
+        } catch (_: Exception) { endConnectionAttempt() }
+    }
+
+    /** Mark a connection attempt in progress, with a timeout backstop. */
+    private fun beginConnectionAttempt() {
+        connectionInProgress = true
+        connectAttemptTimeout?.cancel()
+        connectAttemptTimeout = scope.launch {
+            delay(CONNECT_ATTEMPT_TIMEOUT_MS)
+            if (connectionInProgress) {
+                Log.w(TAG, "P2P connection attempt timed out after ${CONNECT_ATTEMPT_TIMEOUT_MS}ms; re-enabling discovery")
+                connectionInProgress = false
+            }
+        }
+    }
+
+    private fun endConnectionAttempt() {
+        connectAttemptTimeout?.cancel()
+        connectAttemptTimeout = null
+        connectionInProgress = false
     }
 
     /** Lowest deviceAddress so two phones don't race connecting to each other. */
@@ -230,7 +266,7 @@ class WifiDirectTransport(
         try {
             m.requestConnectionInfo(ch) { info ->
                 if (info == null || !info.groupFormed) {
-                    connectionInProgress = false
+                    endConnectionAttempt()
                     return@requestConnectionInfo
                 }
                 if (info.isGroupOwner) {
@@ -272,8 +308,13 @@ class WifiDirectTransport(
                 val sock = Socket()
                 sock.connect(InetSocketAddress(host, GROUP_OWNER_TCP_PORT), 5_000)
                 handleNewSocket(sock)
-            } catch (_: Exception) {
-                connectionInProgress = false
+            } catch (e: Exception) {
+                Log.w(TAG, "dial to group owner $host failed: ${e.message}")
+                endConnectionAttempt()
+                // Retry while the group persists — a failed dial otherwise dead-ends
+                // (no further CONNECTION_CHANGED broadcast will arrive). The loop
+                // self-terminates when the group dissolves (groupFormed=false).
+                scheduleReconnect()
             }
         }
     }
@@ -282,7 +323,19 @@ class WifiDirectTransport(
 
     private fun handleNewSocket(sock: Socket) {
         scope.launch {
+            // The finally clears connectionInProgress on EVERY exit — the
+            // handshake-failure early returns used to leave it set, throttling
+            // the transport to one connect attempt per timeout backstop. It
+            // also re-arms the reconnect nudge on failure: a handshake that
+            // dies mid-group leaves no CONNECTION_CHANGED broadcast to retry
+            // from and no PeerLink whose teardown would reschedule, so without
+            // this the client side dead-ends until the group dissolves.
+            var registered = false
             try {
+                // Bounds both the handshake read and the steady-state read
+                // loop: router RTT pings flow every 5s on a healthy link, so
+                // an idle read this long means the peer is gone without a FIN.
+                try { sock.soTimeout = READ_IDLE_TIMEOUT_MS } catch (_: Exception) {}
                 val out = sock.getOutputStream()
                 val input = sock.getInputStream()
                 // Send: version(1) || localPeerID(8)
@@ -297,20 +350,30 @@ class WifiDirectTransport(
                     sock.close(); return@launch
                 }
                 if (remote == localPeerID) { sock.close(); return@launch }
-                if (peers.containsKey(remote)) { sock.close(); return@launch }
                 val link = PeerLink(remote, sock)
-                peers[remote] = link
-                connectionInProgress = false
+                // Atomic registration: two concurrent handshakes for the same
+                // remote (double CONNECTION_CHANGED broadcasts, reconnect nudge
+                // overlapping a broadcast-driven dial) must not both register —
+                // a containsKey pre-check raced, and the blind second put
+                // silently superseded a LIVE link that then leaked on teardown.
+                if (peers.putIfAbsent(remote, link) != null) {
+                    registered = true // duplicate of a live link — don't nudge reconnect
+                    sock.close(); return@launch
+                }
+                registered = true
                 listener?.onTransportPeerConnected(this@WifiDirectTransport, remote)
                 startReadLoop(link)
             } catch (_: Exception) {
                 try { sock.close() } catch (_: Exception) {}
-                connectionInProgress = false
+            } finally {
+                endConnectionAttempt()
+                if (!registered && running) scheduleReconnect()
             }
         }
     }
 
     private fun startReadLoop(link: PeerLink) {
+        startWriteLoop(link)
         link.readJob = scope.launch {
             val input = link.socket.getInputStream()
             val lenBuf = ByteArray(4)
@@ -318,7 +381,7 @@ class WifiDirectTransport(
                 while (isActive && running) {
                     if (!readFully(input, lenBuf)) break
                     val len = ByteBuffer.wrap(lenBuf).int
-                    if (len <= 0 || len > MAX_PACKET) break
+                    if (len <= 0 || len > LinkWriter.MAX_RECEIVE_FRAME) break
                     val data = ByteArray(len)
                     if (!readFully(input, data)) break
                     val tag = BackboneFrame.decode(data)
@@ -336,18 +399,14 @@ class WifiDirectTransport(
         }
     }
 
-    private fun writeFramed(link: PeerLink, data: ByteArray) {
-        scope.launch {
-            try {
-                val out: OutputStream = link.socket.getOutputStream()
-                synchronized(link.socket) {
-                    out.write(ByteBuffer.allocate(4).putInt(data.size).array())
-                    out.write(data)
-                    out.flush()
-                }
-            } catch (_: Exception) {
-                tearDownLink(link)
-            }
+    /** Single writer per link draining [PeerLink.writer] (FIFO per lane, bounded). */
+    private fun startWriteLoop(link: PeerLink) {
+        val out = try { link.socket.getOutputStream() } catch (_: Exception) {
+            tearDownLink(link); return
+        }
+        link.writeJob = link.writer.startWriter(scope, out) { e ->
+            Log.w(TAG, "write failed peer=${link.peerID.rawValue.take(8)} err=${e.message}")
+            tearDownLink(link)
         }
     }
 
@@ -362,19 +421,55 @@ class WifiDirectTransport(
     }
 
     private fun tearDownLink(link: PeerLink) {
-        if (peers.remove(link.peerID) == null) return
-        tagAwarePeers.remove(link.peerID)
+        // Identity-checked EVICTION, unconditional resource cleanup: a stale
+        // teardown still holding a superseded PeerLink must not evict a
+        // replacement registered under the same peerID (matches
+        // WifiBridgeTransport.disconnectConnection), but THIS link's own
+        // socket and writer are closed either way or they leak.
+        val wasRegistered = peers.remove(link.peerID, link)
         link.readJob?.cancel()
+        link.writer.close()
+        link.writeJob?.cancel()
         try { link.socket.close() } catch (_: Exception) {}
+        if (!wasRegistered) return
+        tagAwarePeers.remove(link.peerID)
         listener?.onTransportPeerDisconnected(this, link.peerID)
+        // The P2P group survives a socket-level teardown, so no
+        // CONNECTION_CHANGED broadcast re-fires and pickPeer skips group
+        // members (status CONNECTED, not AVAILABLE): without an explicit
+        // nudge the socket is never re-established until service restart.
+        if (running) scheduleReconnect()
+    }
+
+    /**
+     * Re-run the connection-info flow after a socket-level teardown or a
+     * failed dial while the P2P group is (probably) still formed: the group
+     * owner's accept loop keeps listening, so the client side just re-dials.
+     * Self-terminating: if the group has dissolved, requestConnectionInfo
+     * reports groupFormed=false and the normal discovery path takes over.
+     */
+    private fun scheduleReconnect() {
+        scope.launch {
+            delay(RECONNECT_DELAY_MS)
+            if (!running || peers.isNotEmpty()) return@launch
+            handleConnectionChanged()
+        }
     }
 
     companion object {
         private const val TAG = "WifiDirectTransport"
         const val GROUP_OWNER_TCP_PORT = 8088
-        const val MAX_PACKET = 64 * 1024
+        // Frame size bounds and send-queue sizing live in LinkWriter, shared
+        // by all three backbone transports so they can't drift apart.
         const val DISCOVERY_INTERVAL_MS = 30_000L
         const val HANDSHAKE_VERSION: Byte = 1
+        private const val READ_IDLE_TIMEOUT_MS = 45_000
+        // Socket re-establishment nudge after a teardown inside a still-formed
+        // P2P group (see scheduleReconnect).
+        private const val RECONNECT_DELAY_MS = 5_000L
+        // Group formation can silently fail after connect() reports success;
+        // this bounds how long we suppress new attempts waiting for it.
+        private const val CONNECT_ATTEMPT_TIMEOUT_MS = 30_000L
 
         fun isAvailable(context: Context): Boolean {
             val pm = context.packageManager

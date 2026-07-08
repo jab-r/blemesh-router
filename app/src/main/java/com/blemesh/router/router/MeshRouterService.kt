@@ -18,6 +18,7 @@ import com.blemesh.router.sync.RequestSyncPacket
 import com.blemesh.router.sync.SyncTypeFlags
 import com.blemesh.router.transport.BackboneFrame
 import com.blemesh.router.transport.LanPeerDiscovery
+import com.blemesh.router.transport.LinkWriter
 import com.blemesh.router.transport.RouterTransport
 import com.blemesh.router.transport.WifiBridgeTransport
 import com.blemesh.router.util.MessageDeduplicator
@@ -51,6 +52,14 @@ class MeshRouterService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val RTT_PING_INTERVAL_MS = 5_000L
         private const val RTT_PING_PAYLOAD_BYTES = 8
+        // Liveness: a ping unanswered for this long counts as missed; after
+        // MAX_MISSED_PINGS consecutive misses the peer's connection is torn
+        // down. Without this a router that drops off WiFi without a TCP FIN
+        // stays in the routing table and black-holes directed DMs and
+        // re-broadcasts until a write finally fails. Backstopped by the
+        // transports' own read-idle socket timeout.
+        private const val RTT_PING_TIMEOUT_MS = 10_000L
+        private const val MAX_MISSED_PINGS = 3
         // Sliding window for the retry-storm counter. A (sender,recipient,type)
         // bucket resets if no new origination is seen for this long.
         private const val RETRY_WINDOW_MS = 30_000L
@@ -104,6 +113,13 @@ class MeshRouterService : Service() {
         // the mesh dedup prevents double-processing. Mirrors BACKBONE_PATH_TAG.
         private const val BACKBONE_GOSSIP = true
         private const val BACKBONE_GOSSIP_INTERVAL_MS = 20_000L
+        // Cap on ROUTER_SYNC_DATA frames per reply, half the transports' bulk
+        // send-queue capacity: a full-window reply (~355 frames at the
+        // 400-byte GCS filter) enqueued in one loop would overflow the queue
+        // and silently evict earlier frames (queued DMs included). The
+        // remainder reconciles on subsequent rounds — the peer's next filter
+        // excludes whatever it already received.
+        private const val MAX_SYNC_DATA_FRAMES_PER_ROUND = LinkWriter.BULK_QUEUE_CAPACITY / 2
         // Max region members advertised in one ROUTER_HOME frame. A BLE region is
         // small (tens of peers); this is a defensive bound on frame size. On
         // overflow we log and drop the tail (routes for those peers fall back to
@@ -141,11 +157,14 @@ class MeshRouterService : Service() {
     val bleToBridgeCount: Long get() = bleToBridgeCounter.get()
     val bridgeToBleCount: Long get() = bridgeToBleCounter.get()
 
-    // RTT tracking: nonce -> send time (ns). One global map; nonces are unique.
-    private val outstandingPings = ConcurrentHashMap<Long, Long>()
+    // RTT tracking: nonce -> outstanding ping. One global map; nonces are unique.
+    private data class PingRecord(val sentNs: Long, val transportName: String, val peer: PeerID)
+    private val outstandingPings = ConcurrentHashMap<Long, PingRecord>()
     private val pingNonceSeq = AtomicLong(System.nanoTime())
     // (transport name, peerID) -> last measured RTT in ms.
     private val rttByTransportPeer = ConcurrentHashMap<Pair<String, PeerID>, Long>()
+    // (transport name, peerID) -> consecutive unanswered pings (liveness probe).
+    private val missedPings = ConcurrentHashMap<Pair<String, PeerID>, Int>()
     private var rttJob: Job? = null
 
     // Backbone gossip: the crossable broadcast content reconciled over the WiFi
@@ -261,6 +280,8 @@ class MeshRouterService : Service() {
         backboneGossipJob = null
         outstandingPings.clear()
         rttByTransportPeer.clear()
+        missedPings.clear()
+        packetRetryCounts.clear()
         peerToHomeRouter.clear()
         dmRetryQueue.clear()
         lanDiscovery.stop()
@@ -509,18 +530,25 @@ class MeshRouterService : Service() {
         return route
     }
 
-    /** Hold a directed DM for [recipient] until it becomes routable, or it ages out. */
+    /**
+     * Hold a directed DM for [recipient] until it becomes routable, or it ages
+     * out. All dmRetryQueue deque access (here, flush, sweep) happens inside
+     * compute/computeIfPresent — the map's per-key lock — so a concurrent
+     * remove can never detach a deque between lookup and mutation and strand
+     * the packet.
+     */
     private fun enqueueDmForRetry(recipient: PeerID, packet: BlemeshPacket) {
         val now = System.currentTimeMillis()
-        val queue = dmRetryQueue.computeIfAbsent(recipient) { ArrayDeque() }
-        val size: Int
-        synchronized(queue) {
+        var size = 0
+        dmRetryQueue.compute(recipient) { _, existing ->
+            val queue = existing ?: ArrayDeque()
             while (queue.isNotEmpty() && now - queue.first().enqueuedMs > DM_QUEUE_MAX_AGE_MS) {
                 queue.removeFirst()
             }
             if (queue.size >= DM_QUEUE_MAX_PER_PEER) queue.removeFirst()
             queue.addLast(QueuedDm(packet, now))
             size = queue.size
+            queue
         }
         Log.d(TAG, "DM queued for ${recipient.rawValue.take(8)} (q=$size)")
     }
@@ -533,13 +561,20 @@ class MeshRouterService : Service() {
      * held for the next update. Aged-out entries are dropped.
      */
     private fun flushDmQueue(recipient: PeerID) {
-        val queue = dmRetryQueue[recipient] ?: return
-        val snapshot: List<QueuedDm>
-        synchronized(queue) { snapshot = queue.toList() }
-        if (snapshot.isEmpty()) return
-        val now = System.currentTimeMillis()
+        if (!dmRetryQueue.containsKey(recipient)) return
         val localNow = bleMeshService.isLocalPeer(recipient)
         val route = if (localNow) null else freshRouteFor(recipient)
+        // Snapshot under the map's per-key lock. When directly reachable the
+        // queue is drained and detached in the same atomic step, so a DM
+        // enqueued concurrently lands in a fresh (still-mapped) deque instead
+        // of a detached one and is never lost.
+        val snapshot = ArrayList<QueuedDm>()
+        dmRetryQueue.computeIfPresent(recipient) { _, queue ->
+            snapshot.addAll(queue)
+            if (localNow) null else queue
+        }
+        if (snapshot.isEmpty()) return
+        val now = System.currentTimeMillis()
         var delivered = 0
         for (entry in snapshot) {
             if (now - entry.enqueuedMs > DM_QUEUE_MAX_AGE_MS) continue
@@ -556,8 +591,6 @@ class MeshRouterService : Service() {
             }
         }
         if (localNow) {
-            // Directly reachable now — consider the queue drained.
-            dmRetryQueue.remove(recipient)
             Log.i(TAG, "DM flush ${recipient.rawValue.take(8)}: delivered=$delivered locally")
         } else if (route != null) {
             Log.i(TAG, "DM flush ${recipient.rawValue.take(8)}: re-routed ${snapshot.size} → ${route.transport.name}:${route.routerPeerID.rawValue.take(8)}")
@@ -575,17 +608,19 @@ class MeshRouterService : Service() {
             while (isActive) {
                 delay(DM_SWEEP_INTERVAL_MS)
                 val now = System.currentTimeMillis()
-                val emptyKeys = mutableListOf<PeerID>()
-                for ((recipient, queue) in dmRetryQueue) {
-                    synchronized(queue) {
+                // Expire and (if emptied) unmap each deque in one per-key
+                // atomic step, so a concurrent enqueue can't add to a deque
+                // that this sweep is about to detach.
+                for (recipient in dmRetryQueue.keys) {
+                    dmRetryQueue.computeIfPresent(recipient) { _, queue ->
                         while (queue.isNotEmpty() && now - queue.first().enqueuedMs > DM_QUEUE_MAX_AGE_MS) {
                             queue.removeFirst()
                         }
-                        if (queue.isEmpty()) emptyKeys += recipient
+                        if (queue.isEmpty()) null else queue
                     }
                 }
-                for (k in emptyKeys) dmRetryQueue.remove(k)
                 peerToHomeRouter.entries.removeAll { now - it.value.lastSeenMs > HOME_ROUTER_TTL_MS }
+                packetRetryCounts.entries.removeAll { now - it.value.lastSeenMs > RETRY_WINDOW_MS }
             }
         }
     }
@@ -634,6 +669,12 @@ class MeshRouterService : Service() {
     private val transportListener = object : RouterTransport.Listener {
         override fun onTransportPeerConnected(transport: RouterTransport, peer: PeerID) {
             Log.i(TAG, "Router peer connected via ${transport.name}: ${peer.rawValue.take(8)}")
+            // Fresh liveness slate: a miss counter or in-flight pings surviving
+            // from a previous incarnation of this link must not count against
+            // the new one, or a reconnected peer starts life at missed=1-2 and
+            // a single slow ping tears it down again (flap loop).
+            missedPings.remove(transport.name to peer)
+            purgeOutstandingPings(transport.name, peer)
             // Advertise our backbone path-tag support so the peer knows it may
             // send us tagged frames (and we learn the same from its reply).
             // Until the caps round-trip completes both sides use plain frames.
@@ -649,6 +690,13 @@ class MeshRouterService : Service() {
 
         override fun onTransportPeerDisconnected(transport: RouterTransport, peer: PeerID) {
             Log.i(TAG, "Router peer disconnected from ${transport.name}: ${peer.rawValue.take(8)}")
+            val key = transport.name to peer
+            rttByTransportPeer.remove(key)
+            missedPings.remove(key)
+            // Purge this link's in-flight pings too: left behind, they expire
+            // in the reaper and resurrect the just-cleared miss counter (and
+            // leak forever if the peer never returns).
+            purgeOutstandingPings(transport.name, peer)
         }
 
         override fun onTransportPacketReceived(
@@ -743,10 +791,19 @@ class MeshRouterService : Service() {
         // backbone after a fresher one must not clobber the newer route. This
         // shares learnHomeRoute's monotonic CAS with the ROUTER_HOME writer so
         // the two writers of peerToHomeRouter agree on "more-recent-sighting-wins".
+        //
+        // Clamped to the local clock: the ROUTER_HOME writer supplies evidence
+        // in the LOCAL clock domain (now − advertised age), so a sender phone
+        // whose clock runs fast would otherwise leave future-dated evidence
+        // that pins its route to a stale router after a roam — fresh ROUTER_HOME
+        // claims from the new router could never win the CAS. The clamp keeps
+        // announce-vs-announce ordering intact for sane clocks and bounds the
+        // damage from a skewed one.
         if (packet.type == MessageType.ANNOUNCE.value || packet.type == MessageType.LOXATION_ANNOUNCE.value) {
             val originRouter = visited.firstOrNull() ?: fromRouter
             PeerID.fromLongBE(packet.senderId)?.let { sender ->
-                learnHomeRoute(sender, originRouter, fromTransport, packet.timestamp)
+                val evidenceMs = minOf(packet.timestamp, System.currentTimeMillis())
+                learnHomeRoute(sender, originRouter, fromTransport, evidenceMs)
             }
         }
 
@@ -844,9 +901,13 @@ class MeshRouterService : Service() {
         backboneGossipJob = serviceScope.launch {
             while (isActive) {
                 delay(BACKBONE_GOSSIP_INTERVAL_MS)
+                // One filter per round: buildBackboneFilter copies and re-sorts
+                // the full DTN window, so building it per peer repeated that
+                // work for every connected router.
+                val filter = bleMeshService.gossipSyncManager.buildBackboneFilter(CROSSABLE_SYNC_TYPES)
                 for (t in transports) {
                     for (peer in t.connectedPeerIDs()) {
-                        sendRouterSync(t, peer)
+                        sendRouterSync(t, peer, filter)
                         sendRouterHome(t, peer)
                     }
                 }
@@ -859,8 +920,11 @@ class MeshRouterService : Service() {
      * ROUTER_SYNC control frame (payload = RequestSync TLV / GCS filter). The
      * peer replies with ROUTER_SYNC_DATA for anything we're missing.
      */
-    private fun sendRouterSync(transport: RouterTransport, peer: PeerID) {
-        val payload = bleMeshService.gossipSyncManager.buildBackboneFilter(CROSSABLE_SYNC_TYPES)
+    private fun sendRouterSync(
+        transport: RouterTransport,
+        peer: PeerID,
+        payload: ByteArray = bleMeshService.gossipSyncManager.buildBackboneFilter(CROSSABLE_SYNC_TYPES)
+    ) {
         val packet = BlemeshPacket(
             version = BlemeshPacket.PROTOCOL_VERSION,
             type = MessageType.ROUTER_SYNC.value,
@@ -886,8 +950,11 @@ class MeshRouterService : Service() {
     private fun handleRouterSync(fromTransport: RouterTransport, packet: BlemeshPacket, fromRouter: PeerID) {
         val req = RequestSyncPacket.decode(packet.payload) ?: return
         val missing = bleMeshService.gossipSyncManager.collectMissing(req)
-        for (pkt in missing) sendRouterSyncData(fromTransport, fromRouter, pkt)
-        if (missing.isNotEmpty()) {
+        val batch = missing.take(MAX_SYNC_DATA_FRAMES_PER_ROUND)
+        for (pkt in batch) sendRouterSyncData(fromTransport, fromRouter, pkt)
+        if (batch.size < missing.size) {
+            Log.i(TAG, "ROUTER_SYNC from ${fromRouter.rawValue.take(8)}: replying ${batch.size}/${missing.size} packet(s), remainder next round")
+        } else if (missing.isNotEmpty()) {
             Log.d(TAG, "ROUTER_SYNC from ${fromRouter.rawValue.take(8)}: replying ${missing.size} packet(s)")
         }
     }
@@ -1029,15 +1096,37 @@ class MeshRouterService : Service() {
         rttJob = serviceScope.launch {
             while (isActive) {
                 delay(RTT_PING_INTERVAL_MS)
+                reapMissedPings()
                 for (t in transports) {
                     for (peerID in t.connectedPeerIDs()) {
                         sendRouterPing(t, peerID)
                     }
                 }
-                // Garbage-collect pings older than 10x the interval so the map
-                // doesn't grow when peers vanish without replying.
-                val cutoffNs = System.nanoTime() - RTT_PING_INTERVAL_MS * 1_000_000L * 10
-                outstandingPings.entries.removeAll { it.value < cutoffNs }
+            }
+        }
+    }
+
+    /**
+     * Expire unanswered pings and tear down peers that have missed
+     * [MAX_MISSED_PINGS] in a row — the liveness signal for a half-open
+     * connection whose socket never errors (radio loss without a FIN).
+     */
+    private fun reapMissedPings() {
+        val timeoutNs = System.nanoTime() - RTT_PING_TIMEOUT_MS * 1_000_000L
+        val iter = outstandingPings.entries.iterator()
+        while (iter.hasNext()) {
+            val rec = iter.next().value
+            if (rec.sentNs >= timeoutNs) continue
+            iter.remove()
+            val key = rec.transportName to rec.peer
+            val missed = missedPings.merge(key, 1, Int::plus) ?: 1
+            if (missed >= MAX_MISSED_PINGS) {
+                missedPings.remove(key)
+                val transport = transports.firstOrNull { it.name == rec.transportName } ?: continue
+                if (rec.peer in transport.connectedPeerIDs()) {
+                    Log.w(TAG, "Router peer ${rec.peer.rawValue.take(8)} missed $missed pings on ${rec.transportName}; disconnecting")
+                    transport.disconnectPeer(rec.peer)
+                }
             }
         }
     }
@@ -1056,7 +1145,7 @@ class MeshRouterService : Service() {
             payload = payload,
             signature = null
         )
-        outstandingPings[nonce] = System.nanoTime()
+        outstandingPings[nonce] = PingRecord(System.nanoTime(), transport.name, peer)
         transport.sendToPeer(peer, packet)
     }
 
@@ -1087,9 +1176,20 @@ class MeshRouterService : Service() {
     ) {
         if (packet.payload.size < RTT_PING_PAYLOAD_BYTES) return
         val nonce = ByteBuffer.wrap(packet.payload, 0, RTT_PING_PAYLOAD_BYTES).long
-        val sentNs = outstandingPings.remove(nonce) ?: return
-        val rttMs = (System.nanoTime() - sentNs) / 1_000_000L
+        // Any pong from this peer proves the link is alive: reset the miss
+        // counter even when the reaper already expired the matching ping
+        // record (RTT just above RTT_PING_TIMEOUT_MS) — otherwise a
+        // slow-but-answering link accrues misses it can never clear and is
+        // torn down / reconnected in a perpetual flap.
+        missedPings.remove(fromTransport.name to fromRouter)
+        val record = outstandingPings.remove(nonce) ?: return
+        val rttMs = (System.nanoTime() - record.sentNs) / 1_000_000L
         rttByTransportPeer[fromTransport.name to fromRouter] = rttMs
+    }
+
+    /** Drop in-flight ping records for one (transport, peer) link. */
+    private fun purgeOutstandingPings(transportName: String, peer: PeerID) {
+        outstandingPings.entries.removeIf { it.value.transportName == transportName && it.value.peer == peer }
     }
 
     // --- Notification ---

@@ -32,4 +32,16 @@ object PacketIdUtil {
     fun computeIdHex(packet: BlemeshPacket): String {
         return computeIdBytes(packet).joinToString("") { "%02x".format(it) }
     }
+
+    /**
+     * Decode a [computeIdHex] string back to the raw id bytes. The gossip
+     * stores key every packet by idHex computed once at insert time, so sync
+     * rounds decode the stored key instead of re-running SHA-256 over every
+     * window packet on every round.
+     */
+    fun idBytesFromHex(idHex: String): ByteArray =
+        ByteArray(idHex.length / 2) { i ->
+            ((Character.digit(idHex[2 * i], 16) shl 4) or
+                Character.digit(idHex[2 * i + 1], 16)).toByte()
+        }
 }

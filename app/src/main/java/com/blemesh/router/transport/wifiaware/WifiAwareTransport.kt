@@ -22,9 +22,11 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import com.blemesh.router.model.BlemeshPacket
+import com.blemesh.router.model.MessageType
 import com.blemesh.router.model.PeerID
 import com.blemesh.router.protocol.BinaryProtocol
 import com.blemesh.router.transport.BackboneFrame
+import com.blemesh.router.transport.LinkWriter
 import com.blemesh.router.transport.RouterTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,7 +37,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -77,9 +78,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * Identity binding is eager: serviceSpecificInfo carries the 8-byte raw PeerID,
  * so we know the peer's identity before any data flows.
  *
+ * Reconnect: a closed link never re-establishes on its own — the peer keeps
+ * advertising continuously, so the still-active subscribe session will not
+ * re-fire onServiceDiscovered (that needs an onServiceLost first), and the
+ * server role only reacts to the client's wake-up message. The client side
+ * therefore explicitly re-initiates (bounded attempts) after any teardown of
+ * one of its links; a genuine re-discovery resets the attempt budget.
+ *
  * Limitations of this initial implementation (untested in this repo):
  *  - No retry on attach/publish/subscribe failure; restart the service to recover.
- *  - No reconnect on transient network loss.
  *  - Shared static PSK on the NDP link. Android requires a secure link when
  *    setPort/setTransportProtocol are used, so we cannot use an open link.
  *    The PSK is a constant baked into the app — routers within a deployment
@@ -102,9 +109,11 @@ class WifiAwareTransport(
     private val handler = Handler(handlerThread.looper)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private var session: WifiAwareSession? = null
-    private var publishSession: PublishDiscoverySession? = null
-    private var subscribeSession: SubscribeDiscoverySession? = null
+    // Written on the Aware HandlerThread, read from IO-thread teardown paths
+    // (read-loop finally, writer failure) — hence @Volatile.
+    @Volatile private var session: WifiAwareSession? = null
+    @Volatile private var publishSession: PublishDiscoverySession? = null
+    @Volatile private var subscribeSession: SubscribeDiscoverySession? = null
 
     private class PeerLink(
         val peerHandle: PeerHandle,
@@ -115,6 +124,11 @@ class WifiAwareTransport(
         @Volatile var serverSocket: ServerSocket? = null
         @Volatile var socket: Socket? = null
         @Volatile var readJob: Job? = null
+        @Volatile var writeJob: Job? = null
+        // Two-lane bounded send queue + single writer (shared helper): control
+        // frames (ping/pong/caps/sync adverts) can't be starved or evicted by
+        // bulk gossip bursts, and bulk overflow drops-oldest with logging.
+        val writer = LinkWriter("aware:${peerID.rawValue.take(8)}")
         @Volatile var networkCallback: ConnectivityManager.NetworkCallback? = null
         @Volatile var establishStartMs: Long = 0L
         // Monotonic: false -> true exactly once when the socket is published.
@@ -126,6 +140,16 @@ class WifiAwareTransport(
     private val peers = ConcurrentHashMap<PeerID, PeerLink>()
     // Peers that advertised backbone path-tag support (ROUTER_CAPS).
     private val tagAwarePeers = ConcurrentHashMap.newKeySet<PeerID>()
+    // Consecutive client-side re-initiation attempts per peer since the last
+    // established link / genuine discovery. Paces the reconnect loop: fast
+    // retries first, then a slow perpetual fallback (see scheduleClientReconnect).
+    private val reconnectAttempts = ConcurrentHashMap<PeerID, Int>()
+    // Freshest peerHandle seen for each peer on the CURRENT subscribe session.
+    // Recorded on every onServiceDiscovered — including ones swallowed by the
+    // containsKey guard while a reconnect attempt occupies the peers slot — so
+    // an in-flight retry chain adopts the fresh handle instead of burning its
+    // attempts against a stale one after the peer churned handles.
+    private val latestPeerHandle = ConcurrentHashMap<PeerID, PeerHandle>()
     private val nextMessageId = AtomicInteger(1)
     // msgId -> peer the wake-up message was addressed to. Used by the subscribe
     // session's onMessageSendSucceeded/Failed callbacks to log which peer.
@@ -153,6 +177,8 @@ class WifiAwareTransport(
         running = false
         for (link in peers.values.toList()) tearDownLink(link)
         peers.clear()
+        reconnectAttempts.clear()
+        latestPeerHandle.clear()
         try { publishSession?.close() } catch (_: Exception) {}
         try { subscribeSession?.close() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
@@ -171,7 +197,7 @@ class WifiAwareTransport(
             val aware = peerID in tagAwarePeers
             if (taggedPeersOnly && !aware) continue // forwarded frames: tag-aware peers only
             val body = if (visited.isNotEmpty() && aware) tagged else plain
-            writeFramed(link, body)
+            link.writer.enqueue(body, controlLane = false)
         }
     }
 
@@ -181,11 +207,20 @@ class WifiAwareTransport(
         val body = if (visited.isNotEmpty() && peerID in tagAwarePeers) {
             BackboneFrame.encode(visited, plain)
         } else plain
-        writeFramed(link, body)
+        link.writer.enqueue(body, MessageType.isControlLane(packet.type))
     }
 
     override fun connectedPeerIDs(): List<PeerID> =
-        peers.values.filter { it.socket?.isConnected == true }.map { it.peerID }
+        // isConnected alone stays true forever after a successful connect;
+        // isClosed flips once the read loop / liveness teardown closes it.
+        peers.values
+            .filter { link -> link.socket?.let { it.isConnected && !it.isClosed } == true }
+            .map { it.peerID }
+
+    override fun disconnectPeer(peerID: PeerID) {
+        val link = peers[peerID] ?: return
+        tearDownLink(link)
+    }
 
     override fun setPeerBackboneTag(peerID: PeerID, supported: Boolean) {
         if (supported) tagAwarePeers.add(peerID) else tagAwarePeers.remove(peerID)
@@ -259,8 +294,12 @@ class WifiAwareTransport(
                 handleDiscovery(peerHandle, serviceSpecificInfo)
             }
             override fun onServiceLost(peerHandle: PeerHandle, reason: Int) {
+                // The peer is GONE: don't chain reconnect attempts against a
+                // handle that will be stale if/when it returns — its return
+                // fires a fresh onServiceDiscovered, which re-initiates.
+                latestPeerHandle.entries.removeIf { it.value == peerHandle }
                 val match = peers.values.firstOrNull { it.peerHandle == peerHandle }
-                if (match != null) tearDownLink(match)
+                if (match != null) tearDownLink(match, scheduleReconnect = false)
             }
             override fun onMessageSendSucceeded(messageId: Int) {
                 val peerID = pendingMessageIds.remove(messageId) ?: return
@@ -293,16 +332,34 @@ class WifiAwareTransport(
         if (info == null || info.size != 8) return
         val peerID = PeerID.fromBytes(info) ?: return
         if (peerID == localPeerID) return
+        // Record the fresh handle and re-arm the reconnect budget BEFORE the
+        // containsKey early return: a rediscovery arriving while a doomed
+        // reconnect attempt occupies the peers slot must still refresh both,
+        // or the retry chain burns its attempts against a stale handle and
+        // this (swallowed) event was the only re-arm that would ever fire.
+        latestPeerHandle[peerID] = peerHandle
+        reconnectAttempts.remove(peerID)
         if (peers.containsKey(peerID)) return
 
         // Only the lower-PeerID side initiates from subscribe. The higher side
         // will be notified via its publish-session onMessageReceived.
         if (localPeerID.rawValue >= peerID.rawValue) return
 
+        Log.d(TAG, "Aware discovered ${shortId(peerID)} (role=client) peerHandle=$peerHandle")
+        initiateClientLink(peerHandle, peerID)
+    }
+
+    /**
+     * Client-role link initiation: register the PeerLink, send the wake-up
+     * message so the peer's publish session learns our identity, and start
+     * NDP setup. Called from a fresh onServiceDiscovered and from
+     * [scheduleClientReconnect] (the subscribe session — and therefore the
+     * stored [peerHandle] — is still valid in both cases).
+     */
+    private fun initiateClientLink(peerHandle: PeerHandle, peerID: PeerID) {
         val sub = subscribeSession ?: return
         val link = PeerLink(peerHandle, peerID, isServer = false)
-        peers[peerID] = link
-        Log.d(TAG, "Aware discovered ${shortId(peerID)} (role=client) peerHandle=$peerHandle")
+        if (peers.putIfAbsent(peerID, link) != null) return
 
         val ourId = localPeerID.toBytes()
         if (ourId == null) {
@@ -384,9 +441,20 @@ class WifiAwareTransport(
                     try {
                         val sock = server.accept()
                         Log.i(TAG, "server.accept returned peer=${shortId(link.peerID)} +${System.currentTimeMillis() - acceptStart}ms remote=${sock.inetAddress}")
+                        try { sock.soTimeout = READ_IDLE_TIMEOUT_MS } catch (_: Exception) {}
                         synchronized(link) {
                             link.established = true
                             link.socket = sock
+                        }
+                        // A teardown may have raced the blocking accept and
+                        // already evicted this link: publishing it now would
+                        // create a ghost (spurious connected event, socket no
+                        // send path can reach). tearDownLink closes the
+                        // resources even for a de-registered link.
+                        if (peers[link.peerID] !== link) {
+                            Log.w(TAG, "server accept completed for de-registered link peer=${shortId(link.peerID)}; discarding")
+                            handler.post { tearDownLink(link) }
+                            return@launch
                         }
                         link.watchdog?.cancel()
                         link.watchdog = null
@@ -460,12 +528,22 @@ class WifiAwareTransport(
                     try {
                         val sock = network.socketFactory.createSocket(peerIp, peerPort)
                         Log.i(TAG, "client connect returned peer=${shortId(link.peerID)} +${System.currentTimeMillis() - dialStart}ms")
+                        try { sock.soTimeout = READ_IDLE_TIMEOUT_MS } catch (_: Exception) {}
                         synchronized(link) {
                             link.established = true
                             link.socket = sock
                         }
+                        // See the server-side twin: a teardown that raced the
+                        // blocking dial already evicted this link — don't
+                        // publish a ghost.
+                        if (peers[link.peerID] !== link) {
+                            Log.w(TAG, "client connect completed for de-registered link peer=${shortId(link.peerID)}; discarding")
+                            handler.post { tearDownLink(link) }
+                            return@launch
+                        }
                         link.watchdog?.cancel()
                         link.watchdog = null
+                        reconnectAttempts.remove(link.peerID)
                         listener?.onTransportPeerConnected(this@WifiAwareTransport, link.peerID)
                         startReadLoop(link)
                     } catch (e: Exception) {
@@ -522,6 +600,7 @@ class WifiAwareTransport(
     // --- Length-prefixed packet I/O ---
 
     private fun startReadLoop(link: PeerLink) {
+        startWriteLoop(link)
         link.readJob = scope.launch {
             val sock = link.socket ?: return@launch
             val input: InputStream = sock.getInputStream()
@@ -530,7 +609,7 @@ class WifiAwareTransport(
                 while (isActive && running) {
                     if (!readFully(input, lenBuf)) break
                     val len = ByteBuffer.wrap(lenBuf).int
-                    if (len <= 0 || len > MAX_PACKET) break
+                    if (len <= 0 || len > LinkWriter.MAX_RECEIVE_FRAME) break
                     val data = ByteArray(len)
                     if (!readFully(input, data)) break
                     val tag = BackboneFrame.decode(data)
@@ -541,26 +620,23 @@ class WifiAwareTransport(
                     }
                 }
             } catch (_: Exception) {
-                // fall through
+                // fall through (includes SocketTimeoutException from the
+                // read-idle liveness bound)
             } finally {
                 tearDownLink(link)
             }
         }
     }
 
-    private fun writeFramed(link: PeerLink, data: ByteArray) {
+    /** Single writer per link draining [PeerLink.writer] (FIFO per lane, bounded). */
+    private fun startWriteLoop(link: PeerLink) {
         val sock = link.socket ?: return
-        scope.launch {
-            try {
-                val out: OutputStream = sock.getOutputStream()
-                synchronized(sock) {
-                    out.write(ByteBuffer.allocate(4).putInt(data.size).array())
-                    out.write(data)
-                    out.flush()
-                }
-            } catch (_: Exception) {
-                tearDownLink(link)
-            }
+        val out = try { sock.getOutputStream() } catch (_: Exception) {
+            handler.post { tearDownLink(link) }; return
+        }
+        link.writeJob = link.writer.startWriter(scope, out) { e ->
+            Log.w(TAG, "write failed peer=${shortId(link.peerID)} err=${e.message}")
+            tearDownLink(link)
         }
     }
 
@@ -574,19 +650,30 @@ class WifiAwareTransport(
         return true
     }
 
-    private fun tearDownLink(link: PeerLink) {
-        if (peers.remove(link.peerID) == null) return
-        tagAwarePeers.remove(link.peerID)
-        val delta = if (link.establishStartMs > 0) System.currentTimeMillis() - link.establishStartMs else 0L
-        Log.i(TAG, "tearDownLink peer=${shortId(link.peerID)} role=${if (link.isServer) "SERVER" else "CLIENT"} established=${link.established} +${delta}ms")
+    private fun tearDownLink(link: PeerLink, scheduleReconnect: Boolean = true) {
+        // Identity-checked EVICTION, unconditional resource cleanup. Only the
+        // currently-registered link gets the registration-scoped effects
+        // (map/tag eviction, disconnect event, reconnect) — a stale teardown
+        // must not evict a replacement registered under the same peerID
+        // (matches WifiBridgeTransport.disconnectConnection). But THIS link's
+        // own resources are closed either way: a superseded or never/no-longer
+        // registered link would otherwise leak its socket, server socket,
+        // writer coroutine, and network callback forever.
+        val wasRegistered = peers.remove(link.peerID, link)
         link.watchdog?.cancel()
         link.watchdog = null
         link.readJob?.cancel()
+        link.writer.close()
+        link.writeJob?.cancel()
         try { link.socket?.close() } catch (_: Exception) {}
         try { link.serverSocket?.close() } catch (_: Exception) {}
         link.networkCallback?.let {
             try { connectivityMgr.unregisterNetworkCallback(it) } catch (_: Exception) {}
         }
+        if (!wasRegistered) return
+        tagAwarePeers.remove(link.peerID)
+        val delta = if (link.establishStartMs > 0) System.currentTimeMillis() - link.establishStartMs else 0L
+        Log.i(TAG, "tearDownLink peer=${shortId(link.peerID)} role=${if (link.isServer) "SERVER" else "CLIENT"} established=${link.established} +${delta}ms")
         // Drop any wake-up message ids still waiting on success/fail callbacks
         // for this peer -- their callbacks would otherwise log a stale peer.
         val iter = pendingMessageIds.entries.iterator()
@@ -594,12 +681,64 @@ class WifiAwareTransport(
             if (iter.next().value == link.peerID) iter.remove()
         }
         listener?.onTransportPeerDisconnected(this, link.peerID)
+        // A torn-down link never comes back on its own (see class doc): the
+        // client role must explicitly re-initiate — the peer's still-visible
+        // advertisement won't re-fire onServiceDiscovered, and the server
+        // role only reacts to the client's wake-up message.
+        if (scheduleReconnect && running && !link.isServer) scheduleClientReconnect(link.peerHandle, link.peerID)
+    }
+
+    /**
+     * Client-side re-initiation after a teardown (liveness probe, watchdog,
+     * read error): fast retries first, then a slow perpetual fallback rather
+     * than giving up — with the peer still advertising, no fresh
+     * onServiceDiscovered will ever fire (class doc), so a hard stop would
+     * recreate the permanent-severance bug this machinery exists to fix.
+     * Each attempt uses the freshest known peerHandle ([latestPeerHandle])
+     * in case the peer churned handles since the teardown. Skipped when the
+     * subscribe session was replaced in the meantime — a restarted session
+     * invalidates stored handles, and its own onServiceDiscovered
+     * re-initiates instead. A genuine re-discovery or a successful connect
+     * resets the pace to fast.
+     */
+    private fun scheduleClientReconnect(peerHandle: PeerHandle, peerID: PeerID) {
+        val sessionAtTeardown = subscribeSession ?: return
+        val attempt = (reconnectAttempts[peerID] ?: 0) + 1
+        reconnectAttempts[peerID] = attempt
+        val delayMs = if (attempt <= MAX_FAST_RECONNECT_ATTEMPTS) {
+            CLIENT_RECONNECT_DELAY_MS
+        } else {
+            if (attempt == MAX_FAST_RECONNECT_ATTEMPTS + 1) {
+                Log.w(TAG, "Aware reconnect to ${shortId(peerID)} still failing after $MAX_FAST_RECONNECT_ATTEMPTS attempts; slowing to every ${SLOW_RECONNECT_DELAY_MS / 1000}s")
+            }
+            SLOW_RECONNECT_DELAY_MS
+        }
+        scope.launch {
+            delay(delayMs)
+            if (!running || peers.containsKey(peerID)) return@launch
+            if (subscribeSession !== sessionAtTeardown) return@launch
+            handler.post {
+                if (!running || peers.containsKey(peerID) || subscribeSession !== sessionAtTeardown) return@post
+                Log.i(TAG, "Aware re-initiating client link to ${shortId(peerID)} (attempt $attempt)")
+                initiateClientLink(latestPeerHandle[peerID] ?: peerHandle, peerID)
+            }
+        }
     }
 
     companion object {
         private const val TAG = "WifiAwareTransport"
         const val SERVICE_NAME = "blemesh-router-v1"
-        const val MAX_PACKET = 64 * 1024
+        // Frame size bounds and send-queue sizing live in LinkWriter, shared
+        // by all three backbone transports so they can't drift apart.
+        // Read-idle liveness bound; router RTT pings flow every 5s, so an
+        // idle read this long means a dead link (isConnected never flips on
+        // silent peer loss).
+        private const val READ_IDLE_TIMEOUT_MS = 45_000
+        // Client-side re-initiation after a teardown (see scheduleClientReconnect):
+        // fast attempts first, then a slow perpetual fallback.
+        private const val CLIENT_RECONNECT_DELAY_MS = 5_000L
+        private const val MAX_FAST_RECONNECT_ATTEMPTS = 5
+        private const val SLOW_RECONNECT_DELAY_MS = 60_000L
         // IPPROTO_TCP from posix; WifiAwareNetworkSpecifier expects this raw int.
         private const val IPPROTO_TCP = 6
         // Static PSK satisfies Android's "secure link" requirement when

@@ -18,6 +18,37 @@ class GossipSyncManager(
 ) {
     companion object {
         private const val TAG = "GossipSyncManager"
+
+        /**
+         * Max-min fair (water-filling) split of the GCS id budget across sync
+         * buckets: every non-empty bucket gets an equal share of what remains;
+         * capacity a bucket cannot use spills to the others. Guarantees a
+         * mixed window always reserves at least budget/numBuckets ids for each
+         * bucket that has candidates — presence packets can never fully crowd
+         * out text cargo (or vice versa). Pure + deterministic given
+         * (counts, budget). Mirrors the iOS GossipSyncManager.bucketBudgets.
+         */
+        internal fun bucketBudgets(counts: List<Int>, budget: Int): List<Int> {
+            val result = IntArray(counts.size)
+            if (budget <= 0) return result.toList()
+            var remaining = budget
+            var active = counts.withIndex()
+                .filter { it.value > 0 }
+                .map { it.index to it.value }
+            while (remaining > 0 && active.isNotEmpty()) {
+                val share = (remaining / active.size).coerceAtLeast(1)
+                val unsatisfied = mutableListOf<Pair<Int, Int>>()
+                for ((index, need) in active) {
+                    val take = minOf(need, share, remaining)
+                    result[index] += take
+                    remaining -= take
+                    if (need - take > 0) unsatisfied.add(index to (need - take))
+                    if (remaining == 0) break
+                }
+                active = unsatisfied
+            }
+            return result.toList()
+        }
     }
 
     interface Delegate {
@@ -26,14 +57,38 @@ class GossipSyncManager(
     }
 
     data class Config(
-        val seenCapacity: Int = 1000,
+        // DTN carry buffer (docs/adaptive-mpr-fix.md, iOS festival-scale plan):
+        // sized so the 30-min text horizon below is not silently undone by FIFO
+        // eviction. The router is the mesh's DTN reconciliation point, so it
+        // carries at least the phone-side buffer.
+        val seenCapacity: Int = 6000,
         val gcsMaxBytes: Int = 400,
+        // Keep <= 0.01 (Rice parameter P >= 7): GCSFilter.decodeToSortedSet
+        // reads unary+P-bit codes until EOF, and with P <= 6 the up-to-7 zero
+        // padding bits of the final byte can satisfy a full read and inject
+        // phantom buckets (false-positive membership → wrongly suppressed
+        // sync sends). At P >= 7 the padding can't complete a read. Matches
+        // the reference/iOS decoder, so fix there too before relaxing this.
         val gcsTargetFpr: Double = 0.01,
-        val maxMessageAgeSeconds: Long = 900,
+        // Per-type freshness horizons (DTN store-carry-forward). Async text
+        // (message/fragment) IS the DTN cargo — 30 min so carried packets
+        // survive a walk across the grounds (the old blanket 900s GC'd exactly
+        // what DTN was carrying). Positions/presence are real-time-only
+        // signals — carrying them is anti-useful (a stale position misleads).
+        val messageMaxAgeSeconds: Long = 1800,
+        val fragmentMaxAgeSeconds: Long = 1800, // fragments carry oversized text
+        val loxationMaxAgeSeconds: Long = 900, // profile announce — semi-static
+        val locationUpdateMaxAgeSeconds: Long = 60, // real-time only, never carried
+        // Announce horizon must stay STRICTLY GREATER than
+        // stalePeerTimeoutSeconds: the stale reaper (removeState side effect)
+        // retires a departed peer at ~60–120s, and an equal horizon would let
+        // generic expiry silently drop the entry before the reaper (which owns
+        // the departure cleanup) ever saw it — dead reaper, no removeState.
+        val announceMaxAgeSeconds: Long = 120,
         val maintenanceIntervalSeconds: Long = 30,
         val stalePeerCleanupIntervalSeconds: Long = 60,
         val stalePeerTimeoutSeconds: Long = 60,
-        val fragmentCapacity: Int = 600,
+        val fragmentCapacity: Int = 2400, // scaled with the fragment horizon (was 600)
         val loxationCapacity: Int = 200,
         val locationUpdateCapacity: Int = 100, // indoor position update packets (short-lived)
         val fragmentSyncIntervalSeconds: Long = 30,
@@ -42,7 +97,19 @@ class GossipSyncManager(
         val messageSyncIntervalSeconds: Long = 15,
         val maxPeersPerSync: Int = 2,
         val syncJitterRatio: Double = 0.3
-    )
+    ) {
+        /**
+         * DTN per-type freshness horizon. Unknown/other types get the message
+         * horizon (only the syncable buckets ever consult this).
+         */
+        fun maxAgeSeconds(forType: Byte): Long = when (MessageType.from(forType)) {
+            MessageType.FRAGMENT -> fragmentMaxAgeSeconds
+            MessageType.ANNOUNCE -> announceMaxAgeSeconds
+            MessageType.LOXATION_ANNOUNCE -> loxationMaxAgeSeconds
+            MessageType.LOCATION_UPDATE -> locationUpdateMaxAgeSeconds
+            else -> messageMaxAgeSeconds
+        }
+    }
 
     private class PacketStore {
         private val packets = LinkedHashMap<String, BlemeshPacket>()
@@ -63,11 +130,16 @@ class GossipSyncManager(
             }
         }
 
+        /**
+         * Fresh (idHex, packet) entries in insertion order. The key rides
+         * along so sync rounds can decode the GCS id from it instead of
+         * re-running SHA-256 over every window packet per round.
+         */
         @Synchronized
-        fun allPackets(isFresh: (BlemeshPacket) -> Boolean): List<BlemeshPacket> {
+        fun freshEntries(isFresh: (BlemeshPacket) -> Boolean): List<Pair<String, BlemeshPacket>> {
             return order.mapNotNull { key ->
                 val pkt = packets[key] ?: return@mapNotNull null
-                if (isFresh(pkt)) pkt else null
+                if (isFresh(pkt)) key to pkt else null
             }
         }
 
@@ -183,9 +255,10 @@ class GossipSyncManager(
 
     // --- Internal ---
 
+    /** Per-type DTN horizon (Config.maxAgeSeconds), not one blanket age. */
     private fun isPacketFresh(packet: BlemeshPacket): Boolean {
         val nowMs = System.currentTimeMillis()
-        val thresholdMs = config.maxMessageAgeSeconds * 1000
+        val thresholdMs = config.maxAgeSeconds(packet.type) * 1000
         if (nowMs < thresholdMs) return true
         return packet.timestamp >= nowMs - thresholdMs
     }
@@ -204,15 +277,42 @@ class GossipSyncManager(
 
         when (messageType) {
             MessageType.ANNOUNCE -> {
-                if (!isPacketFresh(packet)) return
+                val sender = PeerID.fromLongBE(packet.senderId) ?: return
+                // Stale-peer check FIRST — it carries the removeState side
+                // effect. The announce horizon (120s) is deliberately close to
+                // stalePeerTimeout (60s); a freshness-first guard would swallow
+                // the stale signal for 60–120s-old announces and leave dead
+                // peer state to the periodic reaper. The signal is bounded and
+                // monotonic, though: only an announce within the announce
+                // horizon AND at least as new as the one we hold is evidence
+                // of departure. An ancient or out-of-order replay (re-emitted
+                // from a restarting node's store, or injected over the
+                // backbone) must never purge fresher presence/profile state —
+                // unbounded, any >60s-old replay erased a live peer on every
+                // receiving segment, re-triggerable at will.
                 if (!isAnnouncementFresh(packet)) {
-                    val sender = PeerID.fromLongBE(packet.senderId) ?: return
-                    removeState(sender)
+                    if (!isPacketFresh(packet)) return
+                    // Decide against the held announce ATOMICALLY (compute
+                    // holds the map's per-key lock): packets are processed on
+                    // concurrent Dispatchers.Default coroutines, so a plain
+                    // read-check-removeState here would race the fresh path's
+                    // merge and erase a fresh announce merged in between.
+                    var departed = false
+                    latestAnnouncementByPeer.compute(sender) { _, held ->
+                        if (held == null || packet.timestamp >= held.second.timestamp) {
+                            departed = true
+                            null // retire the presence entry in the same atomic step
+                        } else held
+                    }
+                    if (departed) removeProfileAndPositionState(sender)
                     return
                 }
+                if (!isPacketFresh(packet)) return
                 val idHex = PacketIdUtil.computeIdHex(packet)
-                val sender = PeerID.fromLongBE(packet.senderId) ?: return
-                latestAnnouncementByPeer[sender] = Pair(idHex, packet)
+                // Monotonic: a replayed older announce never displaces a fresher one.
+                latestAnnouncementByPeer.merge(sender, Pair(idHex, packet)) { held, incoming ->
+                    if (incoming.second.timestamp >= held.second.timestamp) incoming else held
+                }
             }
             MessageType.MESSAGE -> {
                 if (!isBroadcast || !isPacketFresh(packet)) return
@@ -246,8 +346,11 @@ class GossipSyncManager(
             } else {
                 connectedPeers.shuffled().take(config.maxPeersPerSync)
             }
+            // One payload per round: buildGcsPayload copies and re-sorts the
+            // full sync window, so building it per peer repeated that work.
+            val payload = buildGcsPayload(types)
             for (peerID in peersToSync) {
-                sendRequestSync(peerID, types = types)
+                sendRequestSync(peerID, types = types, payload = payload)
             }
         }
         // No broadcast fallback when no peers are mapped: both reference apps
@@ -261,8 +364,11 @@ class GossipSyncManager(
         // after a peer's announce). Do NOT re-add a broadcast REQUEST_SYNC.
     }
 
-    private fun sendRequestSync(peerID: PeerID, types: SyncTypeFlags) {
-        val payload = buildGcsPayload(types)
+    private fun sendRequestSync(
+        peerID: PeerID,
+        types: SyncTypeFlags,
+        payload: ByteArray = buildGcsPayload(types)
+    ) {
         val pkt = BlemeshPacket(
             version = BlemeshPacket.PROTOCOL_VERSION,
             type = MessageType.REQUEST_SYNC.value,
@@ -294,6 +400,14 @@ class GossipSyncManager(
      * ROUTER_SYNC_DATA control frame. Safe to call synchronously off-scope — the
      * stores are @Synchronized and latestAnnouncementByPeer is concurrent.
      *
+     * The diff runs over the SAME windowed candidate set the requester used to
+     * build its filter ([syncWindowCandidates]) — the 400-byte GCS filter only
+     * summarizes ~355 ids, so diffing the ENTIRE store re-sends every stored
+     * packet outside the requester's window every round, forever (a perpetual
+     * multi-thousand-frame re-flood at DTN store sizes, and an empty-filter
+     * initial sync would elicit the whole store over one link). Older cargo
+     * stays stored for relay/DTN carry — it is simply not re-reconciled.
+     *
      * withTTL(0) is copy(ttl=0); the GCS id (PacketIdUtil) excludes ttl, so ids
      * and downstream dedup keys are unperturbed by the reset.
      */
@@ -307,45 +421,58 @@ class GossipSyncManager(
         }
 
         val missing = mutableListOf<BlemeshPacket>()
-
-        if (requestedTypes.contains(MessageType.ANNOUNCE)) {
-            for ((_, pair) in latestAnnouncementByPeer) {
-                val (idHex, pkt) = pair
-                if (!isPacketFresh(pkt)) continue
-                val idBytes = hexToBytes(idHex)
-                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
-            }
+        for ((idHex, pkt) in syncWindowCandidates(requestedTypes)) {
+            val idBytes = PacketIdUtil.idBytesFromHex(idHex)
+            if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
         }
-
-        if (requestedTypes.contains(MessageType.MESSAGE)) {
-            for (pkt in messages.allPackets(::isPacketFresh)) {
-                val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
-            }
-        }
-
-        if (requestedTypes.contains(MessageType.FRAGMENT)) {
-            for (pkt in fragments.allPackets(::isPacketFresh)) {
-                val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
-            }
-        }
-
-        if (requestedTypes.contains(MessageType.LOXATION_ANNOUNCE)) {
-            for (pkt in loxationPackets.allPackets(::isPacketFresh)) {
-                val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
-            }
-        }
-
-        if (requestedTypes.contains(MessageType.LOCATION_UPDATE)) {
-            for (pkt in locationUpdatePackets.allPackets(::isPacketFresh)) {
-                val idBytes = PacketIdUtil.computeIdBytes(pkt)
-                if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
-            }
-        }
-
         return missing
+    }
+
+    /**
+     * The newest-first candidate window a sync round operates on: fresh packets
+     * of the requested types, truncated to the GCS id budget (nMax). SHARED by
+     * filter construction ([buildGcsPayload]) and the response diff
+     * ([collectMissing]) — the two MUST use the same computation or
+     * reconciliation degenerates (see collectMissing).
+     *
+     * The budget is split PER BUCKET (max-min fair via [bucketBudgets]), NOT
+     * over one mixed newest-first list: a publicMessages request mixes
+     * announces (≤120s fresh, one per peer) with text cargo (≤1800s), so in a
+     * dense cell hundreds of always-newer announces crowded every message out
+     * of a single mixed window — text cargo then never synced at exactly the
+     * density the DTN horizon targets. Bucket order is fixed (announce,
+     * message, fragment, loxationAnnounce, locationUpdate) — cross-platform
+     * mirrors must match for best convergence.
+     */
+    private fun syncWindowCandidates(types: SyncTypeFlags): List<Pair<String, BlemeshPacket>> {
+        val buckets = mutableListOf<List<Pair<String, BlemeshPacket>>>()
+        if (types.contains(MessageType.ANNOUNCE)) {
+            buckets.add(latestAnnouncementByPeer.values.filter { isPacketFresh(it.second) })
+        }
+        if (types.contains(MessageType.MESSAGE)) {
+            buckets.add(messages.freshEntries(::isPacketFresh))
+        }
+        if (types.contains(MessageType.FRAGMENT)) {
+            buckets.add(fragments.freshEntries(::isPacketFresh))
+        }
+        if (types.contains(MessageType.LOXATION_ANNOUNCE)) {
+            buckets.add(loxationPackets.freshEntries(::isPacketFresh))
+        }
+        if (types.contains(MessageType.LOCATION_UPDATE)) {
+            buckets.add(locationUpdatePackets.freshEntries(::isPacketFresh))
+        }
+        if (buckets.all { it.isEmpty() }) return emptyList()
+
+        val sortedBuckets = buckets.map { bucket -> bucket.sortedByDescending { it.second.timestamp } }
+
+        val p = GCSFilter.deriveP(config.gcsTargetFpr)
+        val nMax = GCSFilter.estimateMaxElementsForSize(config.gcsMaxBytes, p)
+        val budgets = bucketBudgets(sortedBuckets.map { it.size }, nMax)
+        val window = mutableListOf<Pair<String, BlemeshPacket>>()
+        for ((index, bucket) in sortedBuckets.withIndex()) {
+            window.addAll(bucket.take(budgets[index]))
+        }
+        return window
     }
 
     /**
@@ -356,55 +483,27 @@ class GossipSyncManager(
      */
     fun buildBackboneFilter(types: SyncTypeFlags): ByteArray = buildGcsPayload(types)
 
+    /** Build the REQUEST_SYNC payload over the shared sync window. */
     private fun buildGcsPayload(types: SyncTypeFlags): ByteArray {
-        val candidates = mutableListOf<BlemeshPacket>()
-        if (types.contains(MessageType.ANNOUNCE)) {
-            for ((_, pair) in latestAnnouncementByPeer) {
-                if (isPacketFresh(pair.second)) candidates.add(pair.second)
-            }
-        }
-        if (types.contains(MessageType.MESSAGE)) {
-            candidates.addAll(messages.allPackets(::isPacketFresh))
-        }
-        if (types.contains(MessageType.FRAGMENT)) {
-            candidates.addAll(fragments.allPackets(::isPacketFresh))
-        }
-        if (types.contains(MessageType.LOXATION_ANNOUNCE)) {
-            candidates.addAll(loxationPackets.allPackets(::isPacketFresh))
-        }
-        if (types.contains(MessageType.LOCATION_UPDATE)) {
-            candidates.addAll(locationUpdatePackets.allPackets(::isPacketFresh))
-        }
-
-        if (candidates.isEmpty()) {
+        val window = syncWindowCandidates(types)
+        if (window.isEmpty()) {
             val p = GCSFilter.deriveP(config.gcsTargetFpr)
             return RequestSyncPacket(p = p, m = 1, data = ByteArray(0), types = types).encode()
         }
-
-        candidates.sortByDescending { it.timestamp }
-
-        val p = GCSFilter.deriveP(config.gcsTargetFpr)
-        val nMax = GCSFilter.estimateMaxElementsForSize(config.gcsMaxBytes, p)
-        val cap = when {
-            types == SyncTypeFlags.FRAGMENT -> config.fragmentCapacity.coerceAtLeast(1)
-            types == SyncTypeFlags.LOXATION_ANNOUNCE -> config.loxationCapacity.coerceAtLeast(1)
-            types == SyncTypeFlags.LOCATION_UPDATE -> config.locationUpdateCapacity.coerceAtLeast(1)
-            else -> config.seenCapacity.coerceAtLeast(1)
-        }
-        val takeN = minOf(candidates.size, nMax, cap)
-        if (takeN <= 0) {
-            return RequestSyncPacket(p = p, m = 1, data = ByteArray(0), types = types).encode()
-        }
-
-        val ids = candidates.take(takeN).map { PacketIdUtil.computeIdBytes(it) }
+        val ids = window.map { PacketIdUtil.idBytesFromHex(it.first) }
         val params = GCSFilter.buildFilter(ids, config.gcsMaxBytes, config.gcsTargetFpr)
         val mVal = if (params.m <= 0L) 1 else params.m
         return RequestSyncPacket(p = params.p, m = mVal, data = params.data, types = types).encode()
     }
 
     private fun performPeriodicMaintenance() {
-        cleanupExpiredMessages()
+        // Stale-peer reaper BEFORE generic expiry: the reaper carries the
+        // removeState side effect (retiring the departed peer's presence
+        // state), and generic expiry silently drops the very entries the
+        // reaper inspects — run second, it would never fire (the announce
+        // horizon is deliberately only slightly above the stale timeout).
         cleanupStaleAnnouncementsIfNeeded()
+        cleanupExpiredMessages()
 
         val now = System.currentTimeMillis()
         for (i in syncSchedules.indices) {
@@ -443,22 +542,21 @@ class GossipSyncManager(
     }
 
     private fun removeState(peerID: PeerID) {
+        // Peer departure (stale announce / LEAVE) retires the peer's REAL-TIME
+        // state: presence, profile packets, positions — serving those after
+        // departure is anti-useful. DTN cargo (message/fragment) is
+        // deliberately KEPT: store-carry-forward exists precisely so cargo
+        // outlives the originator's proximity — purging a sender's messages
+        // the moment they walk out of announce range would silently defeat the
+        // 30-min carry horizon (the pre-DTN behavior). Cargo expires by its
+        // own per-type horizon in cleanupExpiredMessages.
         latestAnnouncementByPeer.remove(peerID)
-        val senderLong = peerID.toLongBE()
-        messages.remove { it.senderId == senderLong }
-        fragments.remove { it.senderId == senderLong }
-        loxationPackets.remove { it.senderId == senderLong }
-        locationUpdatePackets.remove { it.senderId == senderLong }
+        removeProfileAndPositionState(peerID)
     }
 
-    private fun hexToBytes(hex: String): ByteArray {
-        val clean = if (hex.length % 2 == 0) hex else "0$hex"
-        val out = ByteArray(clean.length / 2)
-        var i = 0
-        while (i < clean.length) {
-            out[i / 2] = clean.substring(i, i + 2).toInt(16).toByte()
-            i += 2
-        }
-        return out
+    private fun removeProfileAndPositionState(peerID: PeerID) {
+        val senderLong = peerID.toLongBE()
+        loxationPackets.remove { it.senderId == senderLong }
+        locationUpdatePackets.remove { it.senderId == senderLong }
     }
 }

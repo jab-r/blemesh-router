@@ -16,7 +16,10 @@ data class PeerID(val rawValue: String) {
 
         fun fromHexString(hexString: String): PeerID? {
             val normalized = hexString.lowercase().replace(" ", "")
-            return if (normalized.length == HEX_LENGTH && normalized.all { it.isLetterOrDigit() }) {
+            // Strictly hex: isLetterOrDigit() would admit g–z and Unicode
+            // letters, constructing a PeerID whose toBytes() is null and whose
+            // toLongBE() silently aliases to peer 0.
+            return if (normalized.length == HEX_LENGTH && normalized.all { it in '0'..'9' || it in 'a'..'f' }) {
                 PeerID(normalized)
             } else {
                 null
@@ -56,8 +59,8 @@ data class PeerID(val rawValue: String) {
         // map (not mapNotNull): a non-hex pair must fail the whole conversion,
         // not silently yield a short array. A short array would slip past
         // callers like BackboneFrame.encode that assume 8 bytes and arraycopy
-        // a fixed length. (fromHexString accepts any letter/digit, so a
-        // 16-char-but-non-hex PeerID is representable.)
+        // a fixed length. (The primary constructor is public, so a
+        // 16-char-but-non-hex PeerID is still representable.)
         val bytes = rawValue.chunked(2).map { (it.toIntOrNull(16) ?: return null).toByte() }
         return bytes.toByteArray()
     }

@@ -64,6 +64,15 @@ interface RouterTransport {
     fun connectedPeerIDs(): List<PeerID>
 
     /**
+     * Force-close the connection to [peerID] and fire
+     * [Listener.onTransportPeerDisconnected]. Used by the router's liveness
+     * probe when a peer stops answering pings (half-open socket after radio
+     * loss). No-op if the peer is not connected. The transport's own
+     * discovery/reconnect machinery may re-establish the link later.
+     */
+    fun disconnectPeer(peerID: PeerID)
+
+    /**
      * Whether this transport's underlying capability is supported and
      * currently usable on this device. Call before [start]; if false, the
      * transport should be skipped.

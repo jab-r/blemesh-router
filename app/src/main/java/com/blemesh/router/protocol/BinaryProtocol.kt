@@ -35,7 +35,13 @@ object BinaryProtocol {
             var isCompressed = false
             var originalPayloadSize: Int? = null
 
-            if (allowCompression && CompressionUtil.shouldCompress(payload)) {
+            // The compressed-payload prefix stores the ORIGINAL size in 2 bytes
+            // (interop-locked with iOS/loxation-android), so a >0xFFFF original
+            // can't be represented: it would encode fine here but fail the
+            // size check in every receiver's decode and be silently dropped.
+            // Send such payloads uncompressed instead (encode then fails
+            // cleanly on payloadLength if still oversize).
+            if (allowCompression && packet.payload.size <= 0xFFFF && CompressionUtil.shouldCompress(payload)) {
                 CompressionUtil.compress(payload)?.let { compressed ->
                     if (compressed.isNotEmpty() && compressed.size < payload.size) {
                         payload = compressed
