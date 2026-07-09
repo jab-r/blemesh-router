@@ -77,6 +77,25 @@ class GossipSyncManager(
             if (linkMaxFrameBytes == null) return configMaxBytes
             return minOf(configMaxBytes, linkMaxFrameBytes - REQUEST_SYNC_NON_FILTER_OVERHEAD_BYTES)
         }
+
+        /**
+         * Recover the element count a REQUEST_SYNC filter advertises:
+         * GCSFilter.buildFilter sets m = count << p, so n = m >> p (exact).
+         * Used to bound the responder's window (Codex P2 on iOS PR #85,
+         * mirrored): a link-capped requester whose filter is saturated at ~n
+         * ids can never acknowledge packets beyond its newest n, so diffing a
+         * wider responder window against it re-sent the overhang every sync
+         * round forever. null for an EMPTY filter (no size signal —
+         * initial-sync "send me your window") or nonsense params; a saturated
+         * m only under-recovers n (more conservative), and an inflated m is
+         * harmless because the cap is min()'d with the responder's own config
+         * window.
+         */
+        internal fun advertisedFilterElements(p: Int, m: Long, dataIsEmpty: Boolean): Int? {
+            if (dataIsEmpty || p < 1 || p >= 32) return null
+            val n = (m ushr p).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            return if (n >= 1) n else null
+        }
     }
 
     interface Delegate {
@@ -486,6 +505,18 @@ class GossipSyncManager(
      *
      * withTTL(0) is copy(ttl=0); the GCS id (PacketIdUtil) excludes ttl, so ids
      * and downstream dedup keys are unperturbed by the reset.
+     *
+     * The window is additionally bounded by the requester's ADVERTISED filter
+     * element count ([advertisedFilterElements], Codex P2 on iOS PR #85): once
+     * phones ship link-capped filters (#4233), a small-MTU requester's filter
+     * saturates at ~n ids and can never acknowledge packets beyond its newest
+     * n — diffing the responder's full config window against it re-sent the
+     * overhang every 15s round forever. With the cap, a sparse requester
+     * converges incrementally (its filter grows each round until the windows
+     * align) and a saturated one reaches an empty diff. An EMPTY filter
+     * carries no size signal and keeps the uncapped window (initial sync).
+     * Backbone note: router↔router filters keep the config budget on both
+     * sides, so there the cap is a no-op — safe to apply uniformly here.
      */
     fun collectMissing(request: RequestSyncPacket): List<BlemeshPacket> {
         val requestedTypes = request.types ?: SyncTypeFlags.PUBLIC_MESSAGES
@@ -496,8 +527,9 @@ class GossipSyncManager(
             return GCSFilter.contains(sorted, bucket)
         }
 
+        val requesterN = advertisedFilterElements(request.p, request.m, request.data.isEmpty())
         val missing = mutableListOf<BlemeshPacket>()
-        for ((idHex, pkt) in syncWindowCandidates(requestedTypes)) {
+        for ((idHex, pkt) in syncWindowCandidates(requestedTypes, nMaxCap = requesterN)) {
             val idBytes = PacketIdUtil.idBytesFromHex(idHex)
             if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
         }
@@ -521,15 +553,20 @@ class GossipSyncManager(
      * mirrors must match for best convergence.
      *
      * [gcsMaxBytes] overrides the config filter budget for the REQUESTER path
-     * when the link caps it below config (#4233); the RESPONDER path
-     * ([collectMissing]) and the backbone filter keep the config default — a
-     * slightly wider responder window only re-sends packets the requester
-     * already holds (deduped on receive), while a narrower one would break
-     * convergence.
+     * when the link caps it below config (#4233); the RESPONDER path and the
+     * backbone filter keep the config default. [nMaxCap] bounds the RESPONDER
+     * path to the requester's advertised filter element count (Codex P2 on
+     * iOS PR #85, see [collectMissing]): a saturated link-capped filter can
+     * never acknowledge packets beyond its newest n, so a wider responder
+     * window re-sent the overhang every round. null cap (empty filter /
+     * requester path) keeps the config-sized window — never make the
+     * responder window narrower than the REQUESTER's own filter computation,
+     * which is exactly what the advertised count preserves.
      */
     private fun syncWindowCandidates(
         types: SyncTypeFlags,
-        gcsMaxBytes: Int = config.gcsMaxBytes
+        gcsMaxBytes: Int = config.gcsMaxBytes,
+        nMaxCap: Int? = null
     ): List<Pair<String, BlemeshPacket>> {
         val buckets = mutableListOf<List<Pair<String, BlemeshPacket>>>()
         if (types.contains(MessageType.ANNOUNCE)) {
@@ -552,7 +589,8 @@ class GossipSyncManager(
         val sortedBuckets = buckets.map { bucket -> bucket.sortedByDescending { it.second.timestamp } }
 
         val p = GCSFilter.deriveP(config.gcsTargetFpr)
-        val nMax = GCSFilter.estimateMaxElementsForSize(gcsMaxBytes, p)
+        var nMax = GCSFilter.estimateMaxElementsForSize(gcsMaxBytes, p)
+        nMaxCap?.let { nMax = minOf(nMax, it) }
         val budgets = bucketBudgets(sortedBuckets.map { it.size }, nMax)
         val window = mutableListOf<Pair<String, BlemeshPacket>>()
         for ((index, bucket) in sortedBuckets.withIndex()) {

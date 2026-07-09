@@ -11,6 +11,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -56,6 +57,31 @@ class GossipCapToFitTest {
         // REQUEST_MTU (247) and anything larger hit the 185-byte cap.
         assertEquals(185, BleMeshService.maxSingleWriteBytes(247))
         assertEquals(185, BleMeshService.maxSingleWriteBytes(517))
+    }
+
+    @Test
+    fun advertisedFilterElementsRoundTrip() {
+        // The responder bounds its window by the requester's advertised element
+        // count (n = m >> p, since buildFilter sets m = count << p). Round-trip
+        // through the real filter builder so an encoding change breaks this pin.
+        // Mirrors iOS testAdvertisedFilterElementsRoundTrip.
+        for (k in listOf(1, 20, 57, 355)) {
+            val ids = (0 until k).map { "packet-id-$it".toByteArray(Charsets.UTF_8) }
+            val params = GCSFilter.buildFilter(ids, 4096, 0.01)
+            assertEquals(
+                "advertised element count must round-trip for k=$k",
+                k,
+                GossipSyncManager.advertisedFilterElements(params.p, params.m, params.data.isEmpty())
+            )
+        }
+        // Empty filter = initial sync ("send me your window") — no size signal, no cap.
+        assertNull(GossipSyncManager.advertisedFilterElements(7, 1L, dataIsEmpty = true))
+        // Nonsense params → null (no cap; responder stays config-bounded).
+        assertNull(GossipSyncManager.advertisedFilterElements(0, 128L, dataIsEmpty = false))
+        assertNull(GossipSyncManager.advertisedFilterElements(32, 128L, dataIsEmpty = false))
+        // Saturated m only makes the derived n large — min(ownWindow, n) keeps the
+        // responder bounded by its own config; no amplification lever.
+        assertNotNull(GossipSyncManager.advertisedFilterElements(7, 0xFFFF_FFFFL, dataIsEmpty = false))
     }
 
     @Test
@@ -187,6 +213,43 @@ class GossipCapToFitTest {
                 "unsized filter should use the config budget (got ${wide!!.data.size}B)",
                 wide.data.size > 185 - GossipSyncManager.REQUEST_SYNC_NON_FILTER_OVERHEAD_BYTES &&
                     wide.data.size <= 400
+            )
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun responderWindowCappedByAdvertisedFilterSize() {
+        // Codex P2 on iOS PR #85, mirrored: a requester whose (link-capped)
+        // filter advertises only n ids can never acknowledge more than its
+        // newest n, so the responder must not diff a wider window against it —
+        // pre-fix this returned ~200 packets (the full config window) every
+        // round forever. An empty filter (initial sync) stays uncapped.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val mgr = GossipSyncManager(PeerID.fromLongBE(0x0102030405060708L)!!, scope)
+            val now = System.currentTimeMillis()
+            for (n in 0 until 200) {
+                mgr.onPublicPacketSeen(message(sender = 0x3000L + n, ts = now - n))
+            }
+            val emptyReq = RequestSyncPacket(
+                p = 7, m = 1, data = ByteArray(0), types = SyncTypeFlags.PUBLIC_MESSAGES
+            )
+            awaitCount(mgr, emptyReq, 200) // empty filter → uncapped window
+
+            // A filter advertising 5 ids (none of which we hold) caps the
+            // response window at 5 — not the ~200 the config window allows.
+            val ids = (0 until 5).map { "foreign-id-$it".toByteArray(Charsets.UTF_8) }
+            val params = GCSFilter.buildFilter(ids, 400, 0.01)
+            val capped = RequestSyncPacket(
+                p = params.p, m = params.m, data = params.data,
+                types = SyncTypeFlags.PUBLIC_MESSAGES
+            )
+            val missing = mgr.collectMissing(capped)
+            assertTrue(
+                "responder window must be capped at the advertised 5 ids (got ${missing.size})",
+                missing.size in 1..5
             )
         } finally {
             scope.cancel()
