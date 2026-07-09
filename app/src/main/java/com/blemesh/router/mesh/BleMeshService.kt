@@ -105,6 +105,15 @@ class BleMeshService(
         // 23-byte default MTU (a fragment frame's fixed overhead alone
         // exceeds that budget). Flushed by onMtuChanged.
         private const val PENDING_MTU_QUEUE_MAX = 16
+
+        /**
+         * Max encoded-packet bytes writable to a connection in one GATT frame:
+         * the ATT payload budget (mtu − 3) clamped to [20, 185]. Single source
+         * of truth shared by [sendPacketToConnection] and the gossip
+         * delegate's maxSingleFrameBytes — #4233 sizes the unfragmentable
+         * ttl=0 REQUEST_SYNC frames to exactly the budget the write path uses.
+         */
+        internal fun maxSingleWriteBytes(mtu: Int): Int = (mtu - 3).coerceIn(20, 185)
     }
 
     /**
@@ -1145,7 +1154,7 @@ class BleMeshService(
         preEncoded: ByteArray? = null
     ) {
         val encoded = preEncoded ?: BinaryProtocol.encode(packet) ?: return
-        val maxSingleWrite = (connection.mtu - 3).coerceIn(20, 185)
+        val maxSingleWrite = maxSingleWriteBytes(connection.mtu)
 
         if (encoded.size <= maxSingleWrite) {
             // Off the caller's thread: callers are often GATT binder callbacks
@@ -1172,6 +1181,21 @@ class BleMeshService(
             }
             Log.d(TAG, "Deferred ${encoded.size}B packet for ${connection.address} until MTU negotiation (budget=${maxSingleWrite}B)")
             return
+        }
+        // #4233 backstop (visibility, not behavior): a REQUEST_SYNC should be
+        // link-sized upstream (GossipSyncManager.sendRequestSync) and never
+        // reach fragmentation — its ttl=0 FRAGMENT wrappers are dropped at
+        // reference phones' RSR flood-gates unless the phone coincidentally
+        // has its own sync window open toward us. Reachable only when the
+        // gossip delegate had no link info for the target (e.g. the unmapped-
+        // peer broadcast fallback in sendPacketToPeer). RSR responses are
+        // exempt: fragmenting THOSE is deliberate — the requester just opened
+        // its 30s window, so response-direction fragments pass its gate (the
+        // "gate-aware response-direction fragmentation" extension iOS defers
+        // to; do not replace it with iOS's skip-oversized, which would regress
+        // coverage the router already has).
+        if (packet.type == MessageType.REQUEST_SYNC.value) {
+            Log.w(TAG, "Fragmenting ${encoded.size}B REQUEST_SYNC for ${connection.address} (budget=${maxSingleWrite}B) — ttl=0 request fragments die at phones' RSR gates (#4233; requests should be link-sized upstream)")
         }
         val fragments = fragmentationManager.split(encoded, packet.type, safeChunk)
         val recipientFlag = if (!packet.isBroadcast) BlemeshPacket.FLAG_HAS_RECIPIENT else 0
@@ -1346,6 +1370,18 @@ class BleMeshService(
     private val gossipDelegate = object : GossipSyncManager.Delegate {
         override fun sendPacketToPeer(peerID: PeerID, packet: BlemeshPacket) {
             this@BleMeshService.sendPacketToPeer(peerID, packet)
+        }
+
+        override fun maxSingleFrameBytes(peerID: PeerID): Int? {
+            // #4233: resolve the link exactly like sendPacketToPeer (primary
+            // address → connection) so the REQUEST_SYNC size budget matches
+            // the frame budget of the link the request will actually ride.
+            // null (unmapped peer / dropped connection) → the caller falls
+            // back to the config budget and sendPacketToPeer's broadcast
+            // fallback; sendPacketToConnection then warns if that fragments.
+            val address = peerIdToAddress[peerID] ?: return null
+            val connection = connectedPeers[address] ?: return null
+            return maxSingleWriteBytes(connection.mtu)
         }
 
         override fun getConnectedPeers(): List<PeerID> {
