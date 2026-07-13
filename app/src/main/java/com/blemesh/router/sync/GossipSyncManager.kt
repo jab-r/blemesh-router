@@ -49,10 +49,69 @@ class GossipSyncManager(
             }
             return result.toList()
         }
+
+        // --- #4233 Option A (cap-to-fit) — pure, testable egress-sizing policy ---
+
+        /**
+         * Worst-case non-filter bytes of an encoded REQUEST_SYNC: outer
+         * BinaryProtocol (14 header + 8 sender + 8 recipient; 0x60 is on the
+         * NO_COMPRESS list and is unsigned) = 30, plus the RequestSyncPacket
+         * TLV envelope around the GCS data (P 4 + M 7 + data tag/len 3 +
+         * types TLV ≤ 11) ≤ 25. Same value as the iOS constant
+         * (GossipSyncManager.requestSyncNonFilterOverheadBytes) — the wire
+         * encodings are interop-locked. Pinned end-to-end by
+         * GossipCapToFitTest.requestSyncEnvelopeOverheadPinned — if either
+         * encoding grows, that test fails before a frame can silently exceed
+         * a link on hardware.
+         */
+        internal const val REQUEST_SYNC_NON_FILTER_OVERHEAD_BYTES = 56
+
+        /**
+         * Effective GCS filter byte budget for a REQUEST_SYNC over a link that
+         * can carry at most [linkMaxFrameBytes] in one frame. null link info →
+         * config budget (an oversize request then falls into
+         * BleMeshService.sendPacketToConnection's fragmentation path, which
+         * warns — see the REQUEST_SYNC log there).
+         */
+        internal fun effectiveGcsBytes(configMaxBytes: Int, linkMaxFrameBytes: Int?): Int {
+            if (linkMaxFrameBytes == null) return configMaxBytes
+            return minOf(configMaxBytes, linkMaxFrameBytes - REQUEST_SYNC_NON_FILTER_OVERHEAD_BYTES)
+        }
+
+        /**
+         * Recover the element count a REQUEST_SYNC filter advertises:
+         * GCSFilter.buildFilter sets m = count << p, so n = m >> p (exact).
+         * Used to bound the responder's window (Codex P2 on iOS PR #85,
+         * mirrored): a link-capped requester whose filter is saturated at ~n
+         * ids can never acknowledge packets beyond its newest n, so diffing a
+         * wider responder window against it re-sent the overhang every sync
+         * round forever. null for an EMPTY filter (no size signal —
+         * initial-sync "send me your window") or nonsense params; a saturated
+         * m only under-recovers n (more conservative), and an inflated m is
+         * harmless because the cap is min()'d with the responder's own config
+         * window.
+         */
+        internal fun advertisedFilterElements(p: Int, m: Long, dataIsEmpty: Boolean): Int? {
+            if (dataIsEmpty || p < 1 || p >= 32) return null
+            val n = (m ushr p).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            return if (n >= 1) n else null
+        }
     }
 
     interface Delegate {
         fun sendPacketToPeer(peerID: PeerID, packet: BlemeshPacket)
+
+        /**
+         * Max encoded-packet bytes deliverable to this peer in ONE BLE frame
+         * (the write/notify budget of the link a [sendPacketToPeer] will ride),
+         * or null when no link info is available. #4233: REQUEST_SYNC frames
+         * must never be fragmented — the ttl=0 FRAGMENT wrappers are dropped
+         * at reference phones' RSR flood-gates unless the phone coincidentally
+         * has its own sync window open toward us — so requests are sized to
+         * fit this budget instead.
+         */
+        fun maxSingleFrameBytes(peerID: PeerID): Int?
+
         fun getConnectedPeers(): List<PeerID>
     }
 
@@ -63,6 +122,12 @@ class GossipSyncManager(
         // carries at least the phone-side buffer.
         val seenCapacity: Int = 6000,
         val gcsMaxBytes: Int = 400,
+        // #4233 Option A: below this GCS byte budget a link can't carry a
+        // useful filter (a 23-byte default-ATT link nets a negative budget) —
+        // skip the sync round to that peer entirely instead of sending a
+        // degenerate filter that elicits a near-full re-flood. Matches iOS
+        // Config.minGcsBytesForSync.
+        val minGcsBytesForSync: Int = 64,
         // Keep <= 0.01 (Rice parameter P >= 7): GCSFilter.decodeToSortedSet
         // reads unary+P-bit codes until EOF, and with P <= 6 the up-to-7 zero
         // padding bits of the final byte can satisfy a full read and inject
@@ -346,11 +411,15 @@ class GossipSyncManager(
             } else {
                 connectedPeers.shuffled().take(config.maxPeersPerSync)
             }
-            // One payload per round: buildGcsPayload copies and re-sorts the
-            // full sync window, so building it per peer repeated that work.
-            val payload = buildGcsPayload(types)
+            // One payload per DISTINCT link budget per round (#4233):
+            // buildGcsPayload copies and re-sorts the full sync window, so
+            // building it per peer repeated that work — but the filter is now
+            // sized per link, so the cache keys on the effective budget
+            // (post-negotiation BLE links share one 185-byte budget, so this
+            // is still one build per round in the common case).
+            val payloadByBudget = HashMap<Int, ByteArray>()
             for (peerID in peersToSync) {
-                sendRequestSync(peerID, types = types, payload = payload)
+                sendRequestSync(peerID, types = types, payloadCache = payloadByBudget)
             }
         }
         // No broadcast fallback when no peers are mapped: both reference apps
@@ -364,11 +433,37 @@ class GossipSyncManager(
         // after a peer's announce). Do NOT re-add a broadcast REQUEST_SYNC.
     }
 
-    private fun sendRequestSync(
+    /**
+     * #4233 Option A: size the filter to THIS link so the encoded REQUEST_SYNC
+     * always fits one BLE frame — requests are locally built, so they never
+     * need fragmentation (a fragmented request rides ttl=0 FRAGMENT frames
+     * that reference phones drop at their RSR flood-gate as unsolicited
+     * syncable data, unless the phone coincidentally has its own sync window
+     * open toward us — luck-based delivery, and reliably absent exactly at
+     * first contact). Degenerate links (budget < [Config.minGcsBytesForSync],
+     * e.g. a still-at-default-ATT 23-byte link) skip the round with a log;
+     * the next periodic round covers them after MTU negotiation. Unlike iOS
+     * there is no RSR-window registration to reorder here: the router does
+     * not gate inbound ttl=0 responses (processIncomingPacket stores them
+     * unconditionally via onPublicPacketSeen).
+     *
+     * Internal (not private) so tests can drive it synchronously.
+     * [payloadCache] lets one periodic round reuse a built payload across
+     * peers sharing the same effective budget.
+     */
+    internal fun sendRequestSync(
         peerID: PeerID,
         types: SyncTypeFlags,
-        payload: ByteArray = buildGcsPayload(types)
+        payloadCache: MutableMap<Int, ByteArray>? = null
     ) {
+        val linkMax = delegate?.maxSingleFrameBytes(peerID)
+        val gcsBytes = effectiveGcsBytes(config.gcsMaxBytes, linkMax)
+        if (gcsBytes < config.minGcsBytesForSync) {
+            Log.w(TAG, "REQUEST_SYNC to ${peerID.rawValue.take(8)} skipped: degenerate link (linkMax=$linkMax gcsBudget=$gcsBytes)")
+            return
+        }
+        val payload = payloadCache?.getOrPut(gcsBytes) { buildGcsPayload(types, gcsBytes) }
+            ?: buildGcsPayload(types, gcsBytes)
         val pkt = BlemeshPacket(
             version = BlemeshPacket.PROTOCOL_VERSION,
             type = MessageType.REQUEST_SYNC.value,
@@ -410,6 +505,18 @@ class GossipSyncManager(
      *
      * withTTL(0) is copy(ttl=0); the GCS id (PacketIdUtil) excludes ttl, so ids
      * and downstream dedup keys are unperturbed by the reset.
+     *
+     * The window is additionally bounded by the requester's ADVERTISED filter
+     * element count ([advertisedFilterElements], Codex P2 on iOS PR #85): once
+     * phones ship link-capped filters (#4233), a small-MTU requester's filter
+     * saturates at ~n ids and can never acknowledge packets beyond its newest
+     * n — diffing the responder's full config window against it re-sent the
+     * overhang every 15s round forever. With the cap, a sparse requester
+     * converges incrementally (its filter grows each round until the windows
+     * align) and a saturated one reaches an empty diff. An EMPTY filter
+     * carries no size signal and keeps the uncapped window (initial sync).
+     * Backbone note: router↔router filters keep the config budget on both
+     * sides, so there the cap is a no-op — safe to apply uniformly here.
      */
     fun collectMissing(request: RequestSyncPacket): List<BlemeshPacket> {
         val requestedTypes = request.types ?: SyncTypeFlags.PUBLIC_MESSAGES
@@ -420,8 +527,9 @@ class GossipSyncManager(
             return GCSFilter.contains(sorted, bucket)
         }
 
+        val requesterN = advertisedFilterElements(request.p, request.m, request.data.isEmpty())
         val missing = mutableListOf<BlemeshPacket>()
-        for ((idHex, pkt) in syncWindowCandidates(requestedTypes)) {
+        for ((idHex, pkt) in syncWindowCandidates(requestedTypes, nMaxCap = requesterN)) {
             val idBytes = PacketIdUtil.idBytesFromHex(idHex)
             if (!mightContain(idBytes)) missing.add(pkt.withTTL(0))
         }
@@ -443,8 +551,23 @@ class GossipSyncManager(
      * density the DTN horizon targets. Bucket order is fixed (announce,
      * message, fragment, loxationAnnounce, locationUpdate) — cross-platform
      * mirrors must match for best convergence.
+     *
+     * [gcsMaxBytes] overrides the config filter budget for the REQUESTER path
+     * when the link caps it below config (#4233); the RESPONDER path and the
+     * backbone filter keep the config default. [nMaxCap] bounds the RESPONDER
+     * path to the requester's advertised filter element count (Codex P2 on
+     * iOS PR #85, see [collectMissing]): a saturated link-capped filter can
+     * never acknowledge packets beyond its newest n, so a wider responder
+     * window re-sent the overhang every round. null cap (empty filter /
+     * requester path) keeps the config-sized window — never make the
+     * responder window narrower than the REQUESTER's own filter computation,
+     * which is exactly what the advertised count preserves.
      */
-    private fun syncWindowCandidates(types: SyncTypeFlags): List<Pair<String, BlemeshPacket>> {
+    private fun syncWindowCandidates(
+        types: SyncTypeFlags,
+        gcsMaxBytes: Int = config.gcsMaxBytes,
+        nMaxCap: Int? = null
+    ): List<Pair<String, BlemeshPacket>> {
         val buckets = mutableListOf<List<Pair<String, BlemeshPacket>>>()
         if (types.contains(MessageType.ANNOUNCE)) {
             buckets.add(latestAnnouncementByPeer.values.filter { isPacketFresh(it.second) })
@@ -466,7 +589,8 @@ class GossipSyncManager(
         val sortedBuckets = buckets.map { bucket -> bucket.sortedByDescending { it.second.timestamp } }
 
         val p = GCSFilter.deriveP(config.gcsTargetFpr)
-        val nMax = GCSFilter.estimateMaxElementsForSize(config.gcsMaxBytes, p)
+        var nMax = GCSFilter.estimateMaxElementsForSize(gcsMaxBytes, p)
+        nMaxCap?.let { nMax = minOf(nMax, it) }
         val budgets = bucketBudgets(sortedBuckets.map { it.size }, nMax)
         val window = mutableListOf<Pair<String, BlemeshPacket>>()
         for ((index, bucket) in sortedBuckets.withIndex()) {
@@ -479,19 +603,26 @@ class GossipSyncManager(
      * A GCS filter (RequestSync TLV) over the crossable content this node holds
      * for [types] — reusable by the router's WiFi backbone gossip to advertise
      * "what I have" to a peer router. Thin, side-effect-free wrapper over the
-     * same payload builder the BLE REQUEST_SYNC path uses.
+     * same payload builder the BLE REQUEST_SYNC path uses. Deliberately keeps
+     * the full config filter budget (#4233 does not apply): the backbone is
+     * length-prefixed TCP with a 64 KiB LinkWriter send bound, not a BLE frame.
      */
     fun buildBackboneFilter(types: SyncTypeFlags): ByteArray = buildGcsPayload(types)
 
-    /** Build the REQUEST_SYNC payload over the shared sync window. */
-    private fun buildGcsPayload(types: SyncTypeFlags): ByteArray {
-        val window = syncWindowCandidates(types)
+    /**
+     * Build the REQUEST_SYNC payload over the shared sync window.
+     * [gcsMaxBytes] is the link-capped filter budget (#4233) — it bounds BOTH
+     * the id window and the encoded filter so the whole frame fits the target
+     * link (GCSFilter.buildFilter trims until data ≤ maxBytes).
+     */
+    private fun buildGcsPayload(types: SyncTypeFlags, gcsMaxBytes: Int = config.gcsMaxBytes): ByteArray {
+        val window = syncWindowCandidates(types, gcsMaxBytes)
         if (window.isEmpty()) {
             val p = GCSFilter.deriveP(config.gcsTargetFpr)
             return RequestSyncPacket(p = p, m = 1, data = ByteArray(0), types = types).encode()
         }
         val ids = window.map { PacketIdUtil.idBytesFromHex(it.first) }
-        val params = GCSFilter.buildFilter(ids, config.gcsMaxBytes, config.gcsTargetFpr)
+        val params = GCSFilter.buildFilter(ids, gcsMaxBytes, config.gcsTargetFpr)
         val mVal = if (params.m <= 0L) 1 else params.m
         return RequestSyncPacket(p = params.p, m = mVal, data = params.data, types = types).encode()
     }
