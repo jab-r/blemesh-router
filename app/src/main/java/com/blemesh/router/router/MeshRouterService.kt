@@ -294,6 +294,15 @@ class MeshRouterService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * Re-emits the BLE advertisement with the currently persisted beacon/stage
+     * config. Called by ConfigActivity (via [INSTANCE]) after a stage-id save
+     * so the new layout goes on air without a service restart. Returns whether
+     * the advertisement was actually re-emitted (false if the mesh wasn't
+     * running) so the UI doesn't falsely confirm a live change.
+     */
+    fun restartBeaconAdvertising(): Boolean = bleMeshService.restartAdvertising()
+
     // --- Snapshot for UI ---
 
     data class Snapshot(

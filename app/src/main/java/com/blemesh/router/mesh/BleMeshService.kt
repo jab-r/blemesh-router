@@ -640,15 +640,29 @@ class BleMeshService(
                 .build()
             // Beacon element rides in the scan response (the primary AD is near
             // full with the 128-bit service UUID). Generic manufacturer data,
-            // company 0xFFFF + 16 id bytes = 20 B, well under the 31 B budget.
+            // company 0xFFFF: legacy [uuid:16] = 20 B on air, or with a stage
+            // configured v1 [ver][hash:4][uuid:16] = 25 B — both under the
+            // 31 B budget. Stage id is re-read here so restartAdvertising()
+            // picks up a ConfigActivity save without a service restart.
+            val stageId = BeaconIdentity.loadStageId(context)
             val scanResponse = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
-                .addManufacturerData(BeaconIdentity.COMPANY_ID, BeaconIdentity.manufacturerBytes(beaconId))
+                .addManufacturerData(
+                    BeaconIdentity.COMPANY_ID,
+                    BeaconIdentity.advertisementPayload(beaconId, stageId)
+                )
                 .build()
             bleAdvertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
-            Log.d(TAG, "BLE advertising started (beacon id $beaconId)")
+            Log.d(TAG, "BLE advertising started (beacon id $beaconId, stage ${stageId ?: "<none, legacy layout>"})")
         } catch (e: SecurityException) {
             Log.e(TAG, "Missing BLE advertise permission", e)
+        } catch (e: IllegalStateException) {
+            // BluetoothLeAdvertiser.startAdvertising throws if the adapter left
+            // STATE_ON after we fetched the advertiser (BT toggled off, airplane
+            // mode). Now reachable from the ConfigActivity-triggered
+            // restartAdvertising() on the main thread, where it would otherwise
+            // crash the app; next start() re-emits once BT is back.
+            Log.e(TAG, "BLE advertising unavailable (adapter off)", e)
         }
     }
 
@@ -656,6 +670,23 @@ class BleMeshService(
         try {
             bleAdvertiser?.stopAdvertising(advertiseCallback)
         } catch (_: Exception) { }
+    }
+
+    /**
+     * Rebuilds and re-emits the advertisement without restarting the mesh —
+     * called after a stage-id save in ConfigActivity so the new scan-response
+     * layout goes on air immediately (SUBLOCATION_ADVERTISEMENT.md §4:
+     * silent-until-reboot would gut the mid-event router-swap story).
+     *
+     * Returns false when the mesh isn't running (nothing was on air to
+     * restart) so the caller can avoid falsely confirming a live change; the
+     * saved stage id is still picked up at the next [start].
+     */
+    fun restartAdvertising(): Boolean {
+        if (!isRunning) return false
+        stopAdvertising()
+        startAdvertising()
+        return true
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {

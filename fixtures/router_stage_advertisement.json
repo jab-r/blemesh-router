@@ -1,0 +1,209 @@
+{
+  "description": "Router-programmed stage binding vectors (docs/SUBLOCATION_ADVERTISEMENT.md). Cross-platform lockstep across loxation-sw (iOS honor), loxation-android (honor mirror), and blemesh-router (emitter) — check the same file into all three repos (fixtures/README.md convention). Groups: 'stageHash' + 'encode' are normative for the router emitter; 'parse' + 'effectiveMapping' are normative for the phone clients. The advertised overlay is TIER-2 binding only: the pack manifest stays authoritative for venue MEMBERSHIP (memberBeaconIds — keep-alive/repromotion are hash-blind) and stage VALIDITY (declared sublocations); anything less than an unambiguously valid advertisement is treated as ABSENT (fall back to the static tier-1 binding / membership-only), NEVER as a demotion. Nothing is persisted client-side — the overlay is recomputed per flush from fresh sightings.",
+  "advertisementVersion": 1,
+  "companyIdHex": "ffff",
+  "stageHash": {
+    "rule": "stageHash = first 4 bytes of SHA256(UTF-8(stageId)), compared BYTEWISE (never as an integer). stageId is the exact declared sublocation id string — already constrained to lowercase [a-z0-9-]{1,64}, so UTF-8 == ASCII; the router validates (trim, lowercase, regex) BEFORE hashing. No trailing NUL/newline.",
+    "vectors": [
+      { "stageId": "mainstage", "sha256Prefix4Hex": "70c29956" },
+      { "stageId": "bassriver", "sha256Prefix4Hex": "b020d199" },
+      { "stageId": "main-stage", "sha256Prefix4Hex": "94b575e9" },
+      { "stageId": "collide-7912", "sha256Prefix4Hex": "6a35cc01", "note": "collision pair with collide-c21f — pre-brute-forced (4-byte prefixes collide in seconds); used by effectiveMapping ambiguity vector" },
+      { "stageId": "collide-c21f", "sha256Prefix4Hex": "6a35cc01" },
+      { "stageId": "solardome", "sha256Prefix4Hex": "f0b3c0e2" },
+      { "stageId": "x", "sha256Prefix4Hex": "2d711642", "note": "1-char minimum id" },
+      { "stageId": "the-longest-valid-stage-identifier-anyone-should-ever-need-01234", "sha256Prefix4Hex": "f7348fd5", "note": "64-char maximum id" }
+    ]
+  },
+  "encode": {
+    "rule": "Router emitter. androidPayloadHex = the bytes passed to addManufacturerData(0xFFFF, payload); iosMdHex = the manufacturer data as CoreBluetooth surfaces it (company id prepended little-endian; 0xFFFF is byte-order-symmetric). NO stage configured -> legacy layout [uuid:16]. Stage configured -> v1 layout [ver=0x01][stageHash:4][uuid:16]. beacon_uuid is the TRAILING 16 bytes in every version, forever (MUST — this is what keeps every deployed client's suffix-16 membership extraction correct). Version 0x00 is reserved-invalid and never emitted.",
+    "vectors": [
+      {
+        "name": "unconfigured-emits-legacy",
+        "beaconUuidHex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "stageId": null,
+        "androidPayloadHex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "iosMdHex": "ffffa1b2c3d4e5f60718293a4b5c6d7e8f90"
+      },
+      {
+        "name": "configured-emits-v1",
+        "beaconUuidHex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "stageId": "mainstage",
+        "androidPayloadHex": "0170c29956a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "iosMdHex": "ffff0170c29956a1b2c3d4e5f60718293a4b5c6d7e8f90"
+      },
+      {
+        "name": "legacy-uuid-first-byte-0x01",
+        "beaconUuidHex": "01020304050607080910111213141516",
+        "stageId": null,
+        "androidPayloadHex": "01020304050607080910111213141516",
+        "iosMdHex": "ffff01020304050607080910111213141516",
+        "note": "md[2]==0x01 looks like a version byte but length says legacy — pairs with the parse trap vector"
+      }
+    ]
+  },
+  "parse": {
+    "rule": "Phone clients, generic (non-Apple) manufacturer-data branch. LENGTH GATES BEFORE VERSION: md.count==18 -> legacy, uuid=suffix(16), no hash. md.count==23 AND md[0..1]==ffff AND md[2]==0x01 -> uuid=suffix(16), stageHash=md[3..6]. md.count==23 with any other version, any other length >=16, or a non-ffff company -> uuid=suffix(16), NO hash (pre-existing behavior verbatim). Apple prefix (4c00) -> no mfr-derived id at all (never a stage sighting). len<16 -> whole-md hex string id (pre-existing behavior), never a hash. expect.beaconId is the NORMALIZED sighting key (lowercase, dash-strip).",
+    "vectors": [
+      {
+        "name": "legacy-18B",
+        "iosMdHex": "ffffa1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": null }
+      },
+      {
+        "name": "v1-23B",
+        "iosMdHex": "ffff0170c29956a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": "70c29956" }
+      },
+      {
+        "name": "unknown-version-0x02-uuid-only",
+        "iosMdHex": "ffff0270c29956a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": null }
+      },
+      {
+        "name": "trap-legacy-18B-with-md2-0x01",
+        "iosMdHex": "ffff01020304050607080910111213141516",
+        "expect": { "beaconId": "01020304050607080910111213141516", "stageHashHex": null },
+        "note": "length gates before version — a legacy payload whose uuid[0]==0x01 MUST parse as legacy"
+      },
+      {
+        "name": "near-miss-22B-uuid-only",
+        "iosMdHex": "ffff01aabbcca1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": null }
+      },
+      {
+        "name": "near-miss-24B-uuid-only",
+        "iosMdHex": "ffff01aabbccddeea1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": null }
+      },
+      {
+        "name": "non-ffff-company-23B-uuid-only",
+        "iosMdHex": "12340170c29956a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "stageHashHex": null }
+      },
+      {
+        "name": "apple-prefix-no-mfr-id",
+        "iosMdHex": "4c000215a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "expect": { "beaconId": null, "stageHashHex": null },
+        "note": "Apple company id -> extractGlobalBeaconId nil -> never a stage sighting (CB-peripheral fallback ids can't appear in a manifest)"
+      },
+      {
+        "name": "short-payload-hex-id-no-hash",
+        "iosMdHex": "ffffaabbcc",
+        "expect": { "beaconId": "ffffaabbcc", "stageHashHex": null }
+      }
+    ]
+  },
+  "effectiveMapping": {
+    "rule": "effective = manifest.stageMapping (post-parse tier-1 statics); then for each FRESH sighting carrying a stageHash: require sighting.beaconId IN memberBeaconIds (else ignore entirely), require the hash to match EXACTLY ONE declared sublocation id (0 or >=2 matches -> advertisement treated as absent), then effective[beaconId] = matchedStageId (tier-2 override wins while the sighting is fresh). Overlay lifetime == sighting lifetime (25s fresh window); when the advertisement disappears the static binding resumes at the next flush. Selector dynamics (margin/confirm-flush/TTL) run downstream of this map and are NOT fixture-driven (per-platform unit tests, existing convention). rssi values are irrelevant to the mapping itself.",
+    "manifest": {
+      "schemaVersion": 1,
+      "locationId": "fest2026",
+      "sublocations": {
+        "mainstage": { "displayName": "Main Stage" },
+        "bassriver": { "displayName": "Bass River" },
+        "solardome": { "displayName": "Solar Dome" },
+        "collide-7912": {},
+        "collide-c21f": {}
+      },
+      "beacons": {
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+        "0badc0de00112233445566778899aabb": "",
+        "c001d00dc001d00dc001d00dc001d00d": "",
+        "0102030405060708090a_11_22": "bassriver",
+        "deadbeefdeadbeefdeadbeefdeadbeef": "ghost"
+      }
+    },
+    "manifestNote": "Post-parse statics: stageMapping = {a1b2..: mainstage, 0102.._11_22: bassriver} (the 'ghost' binding parse-demotes to membership-only; 0bad../c001.. are membership-only spares). memberBeaconIds = all five keys.",
+    "vectors": [
+      {
+        "name": "spare-with-valid-hash-binds-THE-swap-case",
+        "sightings": [ { "beaconId": "0badc0de00112233445566778899aabb", "rssi": -58, "stageHashHex": "70c29956" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver",
+          "0badc0de00112233445566778899aabb": "mainstage"
+        }
+      },
+      {
+        "name": "non-member-with-valid-hash-ignored-entirely",
+        "sightings": [ { "beaconId": "f00df00df00df00df00df00df00df00d", "rssi": -40, "stageHashHex": "70c29956" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver"
+        }
+      },
+      {
+        "name": "zero-match-hash-preserves-static",
+        "sightings": [ { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rssi": -50, "stageHashHex": "deadbeef" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver"
+        }
+      },
+      {
+        "name": "collision-hash-ambiguous-treated-absent",
+        "sightings": [
+          { "beaconId": "0badc0de00112233445566778899aabb", "rssi": -55, "stageHashHex": "6a35cc01" },
+          { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rssi": -60, "stageHashHex": "6a35cc01" }
+        ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver"
+        },
+        "note": "6a35cc01 matches BOTH collide-7912 and collide-c21f -> ambiguous -> absent: the spare stays membership-only, the static binding survives"
+      },
+      {
+        "name": "advertised-overrides-static",
+        "sightings": [ { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rssi": -50, "stageHashHex": "b020d199" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "bassriver",
+          "0102030405060708090a_11_22": "bassriver"
+        }
+      },
+      {
+        "name": "hashless-sighting-falls-back-to-static",
+        "sightings": [ { "beaconId": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "rssi": -50, "stageHashHex": null } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver"
+        },
+        "note": "same shape as the previous vector minus the hash — the override evaporates with the advertisement, no hold-down timer"
+      },
+      {
+        "name": "n-routers-one-stage",
+        "sightings": [
+          { "beaconId": "0badc0de00112233445566778899aabb", "rssi": -58, "stageHashHex": "70c29956" },
+          { "beaconId": "c001d00dc001d00dc001d00dc001d00d", "rssi": -62, "stageHashHex": "70c29956" }
+        ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver",
+          "0badc0de00112233445566778899aabb": "mainstage",
+          "c001d00dc001d00dc001d00dc001d00d": "mainstage"
+        },
+        "note": "N:1 is first-class — three beacons now bind mainstage; the selector downstream takes the strongest RSSI per stage as it always has"
+      },
+      {
+        "name": "declared-stage-with-no-static-binding-binds",
+        "sightings": [ { "beaconId": "0badc0de00112233445566778899aabb", "rssi": -58, "stageHashHex": "f0b3c0e2" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver",
+          "0badc0de00112233445566778899aabb": "solardome"
+        },
+        "note": "solardome is declared with ZERO static bindings — a venue may author stages and bind every router on-site at deploy time"
+      },
+      {
+        "name": "parse-demoted-ghost-with-valid-adv-binds",
+        "sightings": [ { "beaconId": "deadbeefdeadbeefdeadbeefdeadbeef", "rssi": -63, "stageHashHex": "b020d199" } ],
+        "expect": {
+          "a1b2c3d4e5f60718293a4b5c6d7e8f90": "mainstage",
+          "0102030405060708090a_11_22": "bassriver",
+          "deadbeefdeadbeefdeadbeefdeadbeef": "bassriver"
+        },
+        "note": "the static 'ghost' binding demoted at parse (undeclared stage); a valid live advertisement still binds this member beacon"
+      }
+    ]
+  }
+}
