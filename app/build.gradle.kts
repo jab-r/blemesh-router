@@ -121,4 +121,7 @@ dependencies {
     // Pure-JVM unit tests (no Android framework) for wire-format codecs like
     // BackboneFrame and PeerID. Run with ./gradlew :app:testDebugUnitTest.
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for unit tests (android.jar's copy is a non-functional
+    // stub on the JVM). Used to consume the cross-repo lockstep fixtures.
+    testImplementation("org.json:json:20240303")
 }

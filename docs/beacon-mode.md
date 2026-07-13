@@ -1,7 +1,11 @@
 # Beacon Mode: Router as a Registerable Fixed Beacon
 
-**Status: DESIGN — for team review. No code has landed.**
-June 2026. Companion plan: `beacon-mode-design-doc.md` (repo root). Beacon mode is
+**Status: IMPLEMENTED.** Advertising, identity, and config UI landed June 2026
+(`router/BeaconIdentity.kt`, `mesh/BleMeshService.kt` `startAdvertising`,
+`ui/ConfigActivity.kt`); the **v1 stage (sublocation) advertisement** — an
+operator-set stage id carried as a 4-byte hash in this same element — landed
+July 2026, spec'd in `docs/SUBLOCATION_ADVERTISEMENT.md`.
+Companion plan: `beacon-mode-design-doc.md` (repo root). Beacon mode is
 the **offline trigger** for location switching — see `docs/location-customization.md`.
 
 ## 1. Goal & motivation
@@ -33,7 +37,7 @@ positioning; in this iteration they remain independent (Open Question 5).
 
 | | Generic mfr data | iBeacon | Eddystone-UID |
 |---|---|---|---|
-| On-air size (AD element) | **20 B** | 27 B | ~22 B (service data) |
+| On-air size (AD element) | **20 B** (25 B with the v1 stage hash) | 27 B | ~22 B (service data) |
 | Client support today | ✔ generic path, both platforms | ✔ | ✔ |
 | Identity granularity | 16-byte UUID per device | UUID + major/minor (fleet model) | 10-byte namespace + 6-byte instance |
 | License / spec constraints | none | Apple iBeacon license, fixed layout | Google spec (frozen) |
@@ -67,25 +71,42 @@ The existing primary advertisement is untouched; the beacon element rides in
 the **scan response**, which is currently unused (31-byte budget entirely
 free).
 
-Scan-response AD element:
+Scan-response AD element — two layouts, selected by whether a stage
+(sublocation) id is configured in ConfigActivity
+(`docs/SUBLOCATION_ADVERTISEMENT.md`):
 
 ```
+Legacy (no stage configured — the plain registerable-beacon layout an
+unconfigured router / spare emits):
 [0x13] [0xFF] [0xFF 0xFF] [b0 .. b15]
  len    type   company ID   16-byte beacon UUID
  (19)   (mfr   (0xFFFF,
         data)  little-endian on air)
+
+v1 (stage configured):
+[0x18] [0xFF] [0xFF 0xFF] [0x01] [h0 .. h3]  [b0 .. b15]
+ len    type   company ID   ver    stage hash  16-byte beacon UUID
+ (24)   (mfr   (0xFFFF)           (SHA256(stageId)[0..3])
+        data)
 ```
 
-20 bytes total — fits legacy advertising with 11 bytes to spare. No extended
+| Layout | AD element | Spare (31 B budget) |
+|---|---|---|
+| Legacy | 20 B | 11 B |
+| v1 (stage hash) | 25 B | 6 B |
+
+The beacon UUID is the **trailing 16 bytes in every layout, forever** — both
+phone scanners derive the beacon id as the last 16 bytes of non-Apple
+manufacturer data, so a stage-configured router stays fully sightable
+(membership, keep-alive, re-promotion) by every deployed client. No extended
 advertising, no minSdk/API-level change.
 
-Implementation point: `mesh/BleMeshService.kt:566-584` (`startAdvertising`; the
-`startAdvertising(...)` call is at `:579`) switches from the 3-arg
-`startAdvertising(settings, data, callback)` to the
-4-arg overload with a `scanResponse` built via
-`AdvertiseData.Builder().addManufacturerData(0xFFFF, beaconUuidBytes)`.
-Android's `addManufacturerData` writes the company ID itself; we supply
-exactly the 16 UUID bytes.
+Implementation: `mesh/BleMeshService.kt` `startAdvertising` passes the 4-arg
+overload a `scanResponse` built via
+`AdvertiseData.Builder().addManufacturerData(0xFFFF, payload)` where `payload`
+comes from `BeaconIdentity.advertisementPayload(beaconId, stageId)`.
+Android's `addManufacturerData` writes the company ID itself; we supply only
+the payload bytes.
 
 Activation: always-on while the mesh service runs. No user toggle in this
 iteration.
@@ -118,8 +139,11 @@ No self-registration endpoint in this iteration.
 - `parseGenericBeacon` takes the first **non-Apple** manufacturer-data entry
   (only Apple's company ID is skipped — `0xFFFF` passes), and for payloads
   ≥ 16 bytes formats the **last 16 bytes** as an uppercase dashed UUID.
-  Android's `SparseArray` strips the company ID, so our payload is exactly
-  the 16 UUID bytes — `last 16 == whole payload`.
+  Android's `SparseArray` strips the company ID, so for the legacy layout our
+  payload is exactly the 16 UUID bytes (`last 16 == whole payload`); for the
+  v1 stage layout the payload is 21 bytes and the UUID is the **trailing 16**,
+  which is what makes the stage element back-compatible with every deployed
+  client (`docs/SUBLOCATION_ADVERTISEMENT.md` §2, §7.2).
 
 **loxation-sw** (`Services/BeaconScanManager.swift`, scan started from
 `BLEMeshService.swift:1800-1803`):
@@ -187,18 +211,25 @@ scanning, not introduced by this design):
 
 ## 9. Out of scope (this iteration)
 
-- Any code changes (this document is the review artifact).
 - Provisioning automation / self-registration.
 - Beacon ranging or RSSI calibration (no TX-power field in the generic
   format).
 - User toggle for beacon mode; QR-code display.
 
-## Files to be modified at implementation time
+## Implementation files
 
-- `app/src/main/java/com/blemesh/router/mesh/BleMeshService.kt:566-584` —
-  add the scan response to `startAdvertising` (the call is at `:579`).
-- `app/src/main/java/com/blemesh/router/router/LocalIdentity.kt` — extend
-  (or add sibling `BeaconIdentity.kt`) to generate/persist `beacon_uuid` in
-  the `"router"` prefs file.
-- `app/src/main/java/com/blemesh/router/ui/ConfigActivity.kt` — display
-  UUID + Copy button.
+- `app/src/main/java/com/blemesh/router/router/BeaconIdentity.kt` —
+  generates/persists `beacon_uuid` (and the optional `sublocation_id` stage
+  binding) in the `"router"` prefs file; builds the legacy/v1 scan-response
+  payload (`advertisementPayload`).
+- `app/src/main/java/com/blemesh/router/mesh/BleMeshService.kt` —
+  `startAdvertising` emits the scan response; `restartAdvertising` re-emits it
+  after a config change without restarting the mesh.
+- `app/src/main/java/com/blemesh/router/router/MeshRouterService.kt` —
+  `restartBeaconAdvertising`, the `INSTANCE` bridge ConfigActivity calls to
+  trigger the save-and-re-advertise path.
+- `app/src/main/java/com/blemesh/router/ui/ConfigActivity.kt` — displays the
+  UUID + Copy button; stage-id field with save-and-re-advertise.
+- `fixtures/router_stage_advertisement.json` +
+  `app/src/test/java/com/blemesh/router/router/RouterStageAdvertisementTest.kt`
+  — lockstep vectors for the stage advertisement (emitter groups).
