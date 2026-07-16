@@ -60,8 +60,13 @@ class MeshRouterService : Service() {
         // transports' own read-idle socket timeout.
         private const val RTT_PING_TIMEOUT_MS = 10_000L
         private const val MAX_MISSED_PINGS = 3
-        // Sliding window for the retry-storm counter. A (sender,recipient,type)
-        // bucket resets if no new origination is seen for this long.
+        // Fixed window for the retry-storm counter, anchored at a
+        // (sender,recipient,type) bucket's FIRST origination; the bucket
+        // resets when the window ages out. Anchoring at the first event (not
+        // gap-since-last) keeps steady sub-30s cadences — the phones' ~20s
+        // Noise keepalive (directed 0x12) above all — from accumulating into
+        // bogus perpetual warnings, while ≥3 originations inside one window
+        // still warn. See RetryStormTracker.
         private const val RETRY_WINDOW_MS = 30_000L
 
         // Directed-DM retry queue (region-local routing). A DM whose recipient
@@ -175,14 +180,13 @@ class MeshRouterService : Service() {
     )
     private var backboneGossipJob: Job? = null
 
-    // Counts distinct originations of (sender, recipient, type) within a sliding
-    // window. Each NOISE_HANDSHAKE retransmission carries a fresh timestamp so it
-    // bypasses dedup, but it lands on the same (sender, recipient, type) bucket.
-    // A high count here means the handshake isn't completing — the originator's
-    // Noise stack keeps re-driving the same state because it never sees the next
-    // message back from the peer.
-    private data class RetryCounter(var count: Int, var firstSeenMs: Long, var lastSeenMs: Long)
-    private val packetRetryCounts = ConcurrentHashMap<String, RetryCounter>()
+    // Counts distinct originations of (sender, recipient, type) within a fixed
+    // window (see RETRY_WINDOW_MS). Each NOISE_HANDSHAKE retransmission carries
+    // a fresh timestamp so it bypasses dedup, but it lands on the same
+    // (sender, recipient, type) bucket. A high count here means the handshake
+    // isn't completing — the originator's Noise stack keeps re-driving the same
+    // state because it never sees the next message back from the peer.
+    private val retryStormTracker = RetryStormTracker(RETRY_WINDOW_MS)
 
     // Region-local routing (REGION_LOCAL_ROUTING_SPEC.md).
     //
@@ -281,7 +285,7 @@ class MeshRouterService : Service() {
         outstandingPings.clear()
         rttByTransportPeer.clear()
         missedPings.clear()
-        packetRetryCounts.clear()
+        retryStormTracker.clear()
         peerToHomeRouter.clear()
         dmRetryQueue.clear()
         lanDiscovery.stop()
@@ -629,7 +633,7 @@ class MeshRouterService : Service() {
                     }
                 }
                 peerToHomeRouter.entries.removeAll { now - it.value.lastSeenMs > HOME_ROUTER_TTL_MS }
-                packetRetryCounts.entries.removeAll { now - it.value.lastSeenMs > RETRY_WINDOW_MS }
+                retryStormTracker.reap(now)
             }
         }
     }
@@ -644,11 +648,14 @@ class MeshRouterService : Service() {
     }
 
     /**
-     * Count distinct originations per (sender, recipient, type) bucket. Only
-     * counts MAX_TTL packets — i.e. freshly originated, not relayed copies —
-     * since those are the ones that reflect "the originator's stack hasn't
-     * given up yet". Logs a warning at count thresholds so handshake-retry
-     * storms surface in router.log.
+     * Count distinct originations per (sender, recipient, type) bucket inside
+     * a fixed 30s window (RetryStormTracker — anchored at the bucket's first
+     * event so steady sub-30s cadences like the phones' ~20s 0x12 keepalive
+     * never accumulate into bogus warnings). Only counts MAX_TTL packets —
+     * i.e. freshly originated, not relayed copies — since those are the ones
+     * that reflect "the originator's stack hasn't given up yet". Logs a
+     * warning at count thresholds so handshake-retry storms surface in
+     * router.log.
      */
     private fun trackRetry(direction: String, packet: BlemeshPacket) {
         if ((packet.ttl.toInt() and 0xFF) != BlemeshPacket.MAX_TTL) return
@@ -658,18 +665,9 @@ class MeshRouterService : Service() {
             else packet.recipientPeerID()?.rawValue?.take(8) ?: "?"
         val type = "0x%02x".format(packet.type.toInt() and 0xFF)
         val key = "$sender→$recipient:$type"
-        val now = System.currentTimeMillis()
-        val rc = packetRetryCounts.compute(key) { _, existing ->
-            if (existing == null || now - existing.lastSeenMs > RETRY_WINDOW_MS) {
-                RetryCounter(1, now, now)
-            } else {
-                existing.count++
-                existing.lastSeenMs = now
-                existing
-            }
-        }!!
+        val rc = retryStormTracker.record(key, System.currentTimeMillis())
         if (rc.count == 3 || rc.count == 6 || (rc.count > 6 && rc.count % 5 == 0)) {
-            Log.w(TAG, "RETRY-STORM $direction $key x${rc.count} over ${now - rc.firstSeenMs}ms")
+            Log.w(TAG, "RETRY-STORM $direction $key x${rc.count} over ${rc.windowAgeMs}ms")
         }
     }
 

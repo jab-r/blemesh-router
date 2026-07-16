@@ -83,6 +83,7 @@ The following were re-checked against the reference and the spec; all are byte-f
 
 ### Relay & dedup
 - `shouldRelay = isRelayablePacketType && ttl > 1`; `NOISE_ENCRYPTED (0x12)` excluded — `protocol/BlemeshProtocol.kt:25–30`.
+  *(Correction 2026-07-16: superseded — 0x12 IS relayed since commit 2a32c0c (2026-07-01, iOS parity); `isRelayablePacketType` now returns true for every type.)*
 - TTL decremented *before* rebroadcast (`packet.withDecrementedTTL()`) — `mesh/BleMeshService.kt:474, 504`.
 - Relay jitter window 50–200 ms — `protocol/BlemeshProtocol.kt:33`.
 - Dedup key for non-fragments: `"{senderId}-{timestamp}-{type}"` — `mesh/BleMeshService.kt:548`.

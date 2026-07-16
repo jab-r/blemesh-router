@@ -69,7 +69,7 @@ Offset  Field          Size   Type
 ### Routing Rules
 
 - Relay decision: `shouldRelay()` checks packet type is relayable AND TTL > 1
-- NOISE_ENCRYPTED (0x12) is NOT relayed (end-to-end only)
+- NOISE_ENCRYPTED (0x12) IS relayed hop-by-hop (iOS parity, commit 2a32c0c; payload stays end-to-end encrypted). It is excluded from store-and-forward and gossip storage (`MessageType.SNF_ELIGIBLE` / `GOSSIP_STORED`)
 - Broadcast address: `0xFFFFFFFFFFFFFFFF`
 - Relay jitter: random 50-200ms delay before forwarding
 
