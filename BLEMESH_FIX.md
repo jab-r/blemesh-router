@@ -6,7 +6,8 @@ loxation-android @ d16e7d70 + working tree, loxation-sw @ c0f790a7). Companion d
 
 What was confirmed in lockstep (no action): header layout/flags, packet-ID derivation,
 RequestSyncPacket TLV format, NO_COMPRESS list (matches Android exactly), relay policy
-(ttl>1, never 0x12), TTL decrement on every crossing with floor 0 + inbound MAX clamp,
+(ttl>1, never 0x12 — *since revised: 0x12 IS relayed as of 2a32c0c 2026-07-01, iOS parity*),
+TTL decrement on every crossing with floor 0 + inbound MAX clamp,
 mesh dedup keys, raw-DEFLATE emit + dual-format decode, fragment relay-without-
 reassembly, and — important — **store-and-serve ttl=0 replays pass the phones'
 link-peer flood gates by construction** (unicast replies inside a phone-registered sync
@@ -68,6 +69,9 @@ round — constants identical to the apps.
 
 ### 3. Store-and-forward replays up to 60s-stale NOISE_HANDSHAKE frames
 
+**RESOLVED (2026-07-16):** 0x10 and 0x12 are no longer in `SNF_ELIGIBLE`
+(`model/MessageType.kt:136-141`, with the rationale below recorded in its doc comment).
+
 `model/MessageType.kt:114-119` `SNF_ELIGIBLE` includes 0x10 NOISE_HANDSHAKE (and 0x12
 NOISE_ENCRYPTED); buffered frames replay up to `SNF_MAX_AGE_MS = 60_000`
 (`mesh/BleMeshService.kt:79`) on the peer's next direct ANNOUNCE. Both apps treat an
@@ -115,6 +119,12 @@ accidental collisions negligible, but a malicious peer can poison another sender
 in-flight transfer at the router by reusing its fragID. Include the sender in the key.
 
 ### 7. Phones perpetually fire doomed Noise handshakes at the router (cross-team)
+
+**RESOLVED (2026-07-16):** the router now advertises `nodeType = FIXED_RELAY` (TLV 0x08)
+in its ANNOUNCE (`mesh/BleMeshService.kt:66-72`, spec `NODETYPE_RELAY_ONLY_SPEC.md`), which
+tells updated phones not to initiate handshakes toward it. Still true: isForMe 0x10s
+terminate before `trackRetry`, so any residual hammering from old builds stays invisible
+to the RETRY-STORM diagnostic.
 
 The router announces a real noise static key every 30s (`mesh/BleMeshService.kt:356-379`)
 but silently terminates 0x10 addressed to it (`:906-915`). Both apps proactively

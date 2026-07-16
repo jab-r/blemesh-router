@@ -102,16 +102,18 @@ and never bridged.
 **Delivery mechanism — the real subtlety for us.** `sendPacketToAllLegs` only reaches
 *directly-connected* legs, so it cannot deliver to a multi-hop region member. Local delivery to a
 multi-hop recipient must **re-inject into the BLE mesh** (`injectPacketFromWifi`) and let phone
-relays carry the last hops. **But** directed 1:1 messages are `NOISE_ENCRYPTED` (0x12), which
-`BlemeshProtocol.shouldRelay` returns **false** for — phones do **not** relay 0x12
-(`MeshRouterService.kt:245-247`). So:
+relays carry the last hops.
 
-- For **relayable** directed types, re-injection + phone relay delivers to a multi-hop region member.
-- For **0x12**, re-injection reaches only *directly-connected* phones. A 0x12 recipient that is a
-  region member but not directly connected cannot be reached by re-injection **or** by bridging (it
-  isn't at another router either). The correct handling is **hold/store-and-forward until the
-  recipient reconnects directly** — never bridge it (bridging is pure backbone waste for a local
-  recipient). This edge case is the router team's to design; see Open Questions.
+> **SUPERSEDED (2026-07-16).** The 0x12 special case below no longer exists: since commit
+> 2a32c0c (2026-07-01, iOS parity) `BlemeshProtocol.isRelayablePacketType` returns **true** for
+> every type including 0x12, so a directed 0x12 to a multi-hop region member is carried by the
+> mesh relay like any other type (`MeshRouterService.routeDirected` step 2). Store-and-forward
+> was deliberately **not** adopted for 0x12/0x10 — a stale replayed handshake or ciphertext
+> churns sessions (`MessageType.SNF_ELIGIBLE` rationale, `model/MessageType.kt`).
+
+- ~~For **relayable** directed types, re-injection + phone relay delivers to a multi-hop region member.~~
+- ~~For **0x12**, re-injection reaches only *directly-connected* phones — hold/store-and-forward until
+  the recipient reconnects directly.~~
 
 ## 6. Change 3 — provenance / "came via a router" (DEFERRED)
 
@@ -188,8 +190,9 @@ from signals it already has:
 
 1. **Venue-wide broadcast exception?** Any broadcast type that must stay venue-wide (operator /
    emergency)? Default is none — all broadcasts region-local.
-2. **0x12 to a not-directly-connected region member** (§5): store-and-forward until direct reconnect,
-   or accept non-delivery until reconnect? Either way: do not bridge.
+2. ~~**0x12 to a not-directly-connected region member** (§5): store-and-forward until direct reconnect,
+   or accept non-delivery until reconnect? Either way: do not bridge.~~ **Resolved 2026-07-16:** moot —
+   0x12 is mesh-relayable since 2a32c0c (see §5 supersession note); SnF for 0x12 deliberately rejected.
 3. **Region-set TTL / capacity** — how long since last BLE-side sighting before a peer is considered
    to have left the region (and its directed traffic resumes bridging)? Size cap / eviction.
 4. **Does removing broadcast bridging affect any current operational assumption** (dashboards,
