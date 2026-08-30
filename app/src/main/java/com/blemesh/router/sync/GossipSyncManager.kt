@@ -144,6 +144,15 @@ class GossipSyncManager(
         val fragmentMaxAgeSeconds: Long = 1800, // fragments carry oversized text
         val loxationMaxAgeSeconds: Long = 900, // profile announce — semi-static
         val locationUpdateMaxAgeSeconds: Long = 60, // real-time only, never carried
+        // Find beacons (FIND_MODE_SPEC.md §5) deliberately break the
+        // "positions are real-time only" rule that gives 0x44 its 60s horizon.
+        // That rule exists because carrying a stale PUBLIC position is
+        // anti-useful — it misleads a stranger who has no way to judge it. A
+        // find beacon is the opposite case on both counts: only the sender's
+        // granted audience can decrypt it, and it carries its own fixAge, so a
+        // 10-minute-old friend position renders honestly aged and IS the
+        // product (it is what a DTN mule carry across a festival delivers).
+        val findBeaconMaxAgeSeconds: Long = 900,
         // Announce horizon must stay STRICTLY GREATER than
         // stalePeerTimeoutSeconds: the stale reaper (removeState side effect)
         // retires a departed peer at ~60–120s, and an equal horizon would let
@@ -156,9 +165,21 @@ class GossipSyncManager(
         val fragmentCapacity: Int = 2400, // scaled with the fragment horizon (was 600)
         val loxationCapacity: Int = 200,
         val locationUpdateCapacity: Int = 100, // indoor position update packets (short-lived)
+        // Distinct SENDERS whose newest beacon we carry (the store is
+        // keep-latest-per-peer, so this is a peer count, not a packet count).
+        // Small on purpose: the audience for any one beacon is a handful of
+        // people, so the useful set is bounded by grant density, not crowd
+        // size, and the 900s horizon must not turn into a festival-sized
+        // carry buffer.
+        val findBeaconCapacity: Int = 300,
         val fragmentSyncIntervalSeconds: Long = 30,
         val loxationSyncIntervalSeconds: Long = 60,
         val locationUpdateSyncIntervalSeconds: Long = 15, // frequent for real-time positioning
+        // Between the real-time 0x44 cadence and the semi-static profile one:
+        // the backbone gate already caps a crossing beacon at one per sender
+        // per 30s, so reconciling faster than that only re-diffs an unchanged
+        // window.
+        val findBeaconSyncIntervalSeconds: Long = 30,
         val messageSyncIntervalSeconds: Long = 15,
         val maxPeersPerSync: Int = 2,
         val syncJitterRatio: Double = 0.3
@@ -172,6 +193,7 @@ class GossipSyncManager(
             MessageType.ANNOUNCE -> announceMaxAgeSeconds
             MessageType.LOXATION_ANNOUNCE -> loxationMaxAgeSeconds
             MessageType.LOCATION_UPDATE -> locationUpdateMaxAgeSeconds
+            MessageType.FIND_BEACON -> findBeaconMaxAgeSeconds
             else -> messageMaxAgeSeconds
         }
     }
@@ -229,6 +251,58 @@ class GossipSyncManager(
         }
     }
 
+    /**
+     * Keep-latest-per-SENDER store (FIND_MODE_SPEC.md §5: "newest beacon per
+     * sender"). Distinct from [PacketStore], which is a FIFO stream buffer
+     * holding every packet: a find beacon is a state update, not cargo — the
+     * newest one fully supersedes the sender's previous position, so keeping
+     * older ones would only spend GCS ids re-advertising fixes the receiver's
+     * fresher-only merge is going to discard.
+     *
+     * Insertion is monotonic (a replayed or reordered older beacon never
+     * displaces a fresher held one), matching the receiver-side merge rule.
+     * [capacity] bounds distinct SENDERS; overflow evicts oldest-fix-first, so
+     * a burst of one-off senders cannot push out actively-tracked peers.
+     */
+    private class LatestPerPeerStore {
+        private val latest = ConcurrentHashMap<PeerID, Pair<String, BlemeshPacket>>()
+
+        val size: Int get() = latest.size
+
+        @Synchronized
+        fun insert(sender: PeerID, idHex: String, packet: BlemeshPacket, capacity: Int) {
+            if (capacity <= 0) return
+            latest.merge(sender, idHex to packet) { held, incoming ->
+                if (incoming.second.timestamp >= held.second.timestamp) incoming else held
+            }
+            if (latest.size <= capacity) return
+            latest.entries
+                .sortedBy { it.value.second.timestamp }
+                .take(latest.size - capacity)
+                .forEach { latest.remove(it.key) }
+        }
+
+        /**
+         * Fresh entries, newest-first ordering left to the caller (as
+         * PacketStore).
+         *
+         * @Synchronized like the mutators, so [capacity] is a HARD bound
+         * rather than an eventual one: [insert] merges before it evicts, and
+         * an unsynchronized reader could otherwise observe that intermediate
+         * state and put capacity+1 ids into a sync round. Harmless in itself,
+         * but a store whose stated bound only holds between operations is the
+         * kind of thing a later reader relies on and a later change breaks.
+         */
+        @Synchronized
+        fun freshEntries(isFresh: (BlemeshPacket) -> Boolean): List<Pair<String, BlemeshPacket>> =
+            latest.values.filter { isFresh(it.second) }
+
+        @Synchronized
+        fun removeExpired(isFresh: (BlemeshPacket) -> Boolean) {
+            latest.entries.removeAll { !isFresh(it.value.second) }
+        }
+    }
+
     private data class SyncSchedule(
         val types: SyncTypeFlags,
         val intervalMs: Long,
@@ -241,6 +315,7 @@ class GossipSyncManager(
     private val fragments = PacketStore()
     private val loxationPackets = PacketStore()
     private val locationUpdatePackets = PacketStore()
+    private val findBeacons = LatestPerPeerStore()
     private val latestAnnouncementByPeer = ConcurrentHashMap<PeerID, Pair<String, BlemeshPacket>>()
 
     private var periodicJob: Job? = null
@@ -259,6 +334,9 @@ class GossipSyncManager(
         }
         if (config.locationUpdateCapacity > 0 && config.locationUpdateSyncIntervalSeconds > 0) {
             syncSchedules.add(SyncSchedule(SyncTypeFlags.LOCATION_UPDATE, config.locationUpdateSyncIntervalSeconds * 1000))
+        }
+        if (config.findBeaconCapacity > 0 && config.findBeaconSyncIntervalSeconds > 0) {
+            syncSchedules.add(SyncSchedule(SyncTypeFlags.FIND_BEACON, config.findBeaconSyncIntervalSeconds * 1000))
         }
     }
 
@@ -296,6 +374,10 @@ class GossipSyncManager(
             if (config.locationUpdateCapacity > 0 && config.locationUpdateSyncIntervalSeconds > 0) {
                 delay(500)
                 sendRequestSync(peerID, types = SyncTypeFlags.LOCATION_UPDATE)
+            }
+            if (config.findBeaconCapacity > 0 && config.findBeaconSyncIntervalSeconds > 0) {
+                delay(500)
+                sendRequestSync(peerID, types = SyncTypeFlags.FIND_BEACON)
             }
         }
     }
@@ -398,6 +480,16 @@ class GossipSyncManager(
                 if (!isBroadcast || !isPacketFresh(packet)) return
                 val idHex = PacketIdUtil.computeIdHex(packet)
                 locationUpdatePackets.insert(idHex, packet, config.locationUpdateCapacity.coerceAtLeast(1))
+            }
+            MessageType.FIND_BEACON -> {
+                // Broadcast-only by construction (FIND_MODE_SPEC.md §2 sends it
+                // with no recipientID): a directed 0x4A is malformed, and
+                // storing one would serve a private frame to the whole segment
+                // on the next sync.
+                if (!isBroadcast || !isPacketFresh(packet)) return
+                val sender = PeerID.fromLongBE(packet.senderId) ?: return
+                val idHex = PacketIdUtil.computeIdHex(packet)
+                findBeacons.insert(sender, idHex, packet, config.findBeaconCapacity.coerceAtLeast(1))
             }
             else -> { /* ignore */ }
         }
@@ -584,6 +676,12 @@ class GossipSyncManager(
         if (types.contains(MessageType.LOCATION_UPDATE)) {
             buckets.add(locationUpdatePackets.freshEntries(::isPacketFresh))
         }
+        // FIND_BEACON is LAST — FIND_MODE_SPEC.md §5 pins it at the END of the
+        // fixed bucket order so the existing buckets keep their indices and
+        // cross-platform windows still line up.
+        if (types.contains(MessageType.FIND_BEACON)) {
+            buckets.add(findBeacons.freshEntries(::isPacketFresh))
+        }
         if (buckets.all { it.isEmpty() }) return emptyList()
 
         val sortedBuckets = buckets.map { bucket -> bucket.sortedByDescending { it.second.timestamp } }
@@ -655,6 +753,7 @@ class GossipSyncManager(
         fragments.removeExpired(::isPacketFresh)
         loxationPackets.removeExpired(::isPacketFresh)
         locationUpdatePackets.removeExpired(::isPacketFresh)
+        findBeacons.removeExpired(::isPacketFresh)
     }
 
     private fun cleanupStaleAnnouncementsIfNeeded() {
@@ -685,9 +784,26 @@ class GossipSyncManager(
         removeProfileAndPositionState(peerID)
     }
 
+
     private fun removeProfileAndPositionState(peerID: PeerID) {
         val senderLong = peerID.toLongBE()
         loxationPackets.remove { it.senderId == senderLong }
         locationUpdatePackets.remove { it.senderId == senderLong }
+        // findBeacons is deliberately NOT purged here — the one position store
+        // that survives its sender's departure, and the reason find beacons
+        // live in their own store instead of alongside 0x44 above.
+        //
+        // Retiring positions at departure is right for PUBLIC 0x44: a stranger
+        // who walked out of range is gone, and serving their last fix misleads
+        // someone with no way to judge it. A find beacon inverts every term of
+        // that argument. Only the sender's granted audience can decrypt it, it
+        // carries its own fixAge so the age renders honestly, and the departure
+        // the reaper just observed is the exact moment the position becomes
+        // valuable — "which way did my people go" IS the product
+        // (FIND_MODE_SPEC.md §5). Purging here would silently defeat the 900s
+        // horizon for precisely the peers a DTN mule carry exists to cover, the
+        // same way purging cargo at departure once defeated the 30-min text
+        // horizon. Beacons expire on their own horizon in
+        // cleanupExpiredMessages instead.
     }
 }

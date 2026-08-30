@@ -79,6 +79,16 @@ class MeshRouterService : Service() {
         // crossing announce (~3 missed 30s announce intervals).
         private const val HOME_ROUTER_TTL_MS = 90_000L
 
+        // Find mode (FIND_MODE_SPEC.md §6). Minimum interval between one
+        // sender's find beacons crossing onto the backbone. Beacons inside the
+        // window are coalesced newest-wins and released by the sweep below, so
+        // this bounds backbone COST without discarding freshness — see
+        // FindBeaconBridgeGate. Held beacons are released on the DM sweep tick
+        // (DM_SWEEP_INTERVAL_MS), so the effective release interval is 30-45s;
+        // overshoot is harmless (the spec asks for >= 30s) and the beacon's own
+        // fixAge keeps the delay honest at the receiver.
+        private const val FIND_BEACON_MIN_CROSS_INTERVAL_MS = 30_000L
+
         // --- Backbone path routing (BACKBONE_PATH_ROUTING_SPEC.md, Tier 3) ---
         //
         // Master flag for the visited-router path tag on the WiFi backbone.
@@ -176,7 +186,13 @@ class MeshRouterService : Service() {
     // backbone (presence + location). Mirrors CROSSES_BACKBONE minus LEAVE (no
     // gossip store) and FRAGMENT (cross-backbone reassembly out of scope).
     private val CROSSABLE_SYNC_TYPES = SyncTypeFlags.fromTypes(
-        MessageType.ANNOUNCE, MessageType.LOXATION_ANNOUNCE, MessageType.LOCATION_UPDATE
+        MessageType.ANNOUNCE, MessageType.LOXATION_ANNOUNCE, MessageType.LOCATION_UPDATE,
+        // Find beacons reconcile over the backbone too (FIND_MODE_SPEC.md §5):
+        // the push is a one-shot, so a router that joins the backbone late — or
+        // drops a push — would otherwise carry no beacons for the remote region
+        // until each sender's next 30s crossing. Anti-entropy backfills them,
+        // and the store is newest-per-sender so a round costs one id per sender.
+        MessageType.FIND_BEACON
     )
     private var backboneGossipJob: Job? = null
 
@@ -205,6 +221,11 @@ class MeshRouterService : Service() {
     private data class QueuedDm(val packet: BlemeshPacket, val enqueuedMs: Long)
     private val dmRetryQueue = ConcurrentHashMap<PeerID, ArrayDeque<QueuedDm>>()
     private var dmSweepJob: Job? = null
+
+    // Find mode (FIND_MODE_SPEC.md §6): the per-sender rate limit + newest-wins
+    // coalescer every find beacon passes through before it may cross onto the
+    // backbone. Held beacons are released on the DM sweep tick.
+    private val findBeaconGate = FindBeaconBridgeGate(FIND_BEACON_MIN_CROSS_INTERVAL_MS)
 
     override fun onCreate() {
         super.onCreate()
@@ -288,6 +309,7 @@ class MeshRouterService : Service() {
         retryStormTracker.clear()
         peerToHomeRouter.clear()
         dmRetryQueue.clear()
+        findBeaconGate.clear()
         lanDiscovery.stop()
         bleMeshService.stop()
         for (t in transports) t.stop()
@@ -396,6 +418,20 @@ class MeshRouterService : Service() {
                 Log.d(TAG, "BLE→bridge BCAST-LOCAL $tag (region-local, not bridged)")
                 return
             }
+            // Find mode (FIND_MODE_SPEC.md §6): allowlisted crossing types that
+            // a sender emits on a fast cadence pass a per-sender rate limit
+            // first. A beacon inside its sender's window is coalesced
+            // newest-wins and released by the DM sweep, not dropped — the local
+            // BLE flood and the local gossip store already happened upstream of
+            // this gate, so only the cross-venue copy is deferred.
+            val effectiveType = crossingType(bridged)
+            if (effectiveType != null &&
+                MessageType.isBackboneRateLimited(effectiveType) &&
+                !offerToBackboneGate(bridged)
+            ) {
+                Log.d(TAG, "BLE→bridge BCAST-COALESCE $tag (held for rate limit)")
+                return
+            }
             Log.d(TAG, "BLE→bridge BCAST $tag via ${transports.joinToString(",") { it.name }}")
             broadcastToBackbone(bridged, originVisited())
             bleToBridgeCounter.incrementAndGet()
@@ -467,6 +503,33 @@ class MeshRouterService : Service() {
         Log.d(TAG, "directed QUEUED $tag (awaiting route)")
     }
 
+    /**
+     * Ask [findBeaconGate] whether this rate-limited broadcast may cross now.
+     * A packet with an undecodable sender is let through rather than held: we
+     * have no slot to key it on, the type is still allowlisted, and the dedup
+     * plus the sender's own cadence bound the damage.
+     */
+    private fun offerToBackboneGate(packet: BlemeshPacket): Boolean {
+        val sender = PeerID.fromLongBE(packet.senderId) ?: return true
+        return findBeaconGate.offer(sender, packet, System.currentTimeMillis())
+    }
+
+    /**
+     * Release find beacons whose sender's backbone cooldown has expired. Run
+     * from the DM sweep tick — the released packet is the NEWEST this router
+     * saw during the window, so a far region gets the freshest fix rather than
+     * whichever one happened to arrive after the cooldown.
+     */
+    private fun drainFindBeaconGate() {
+        val released = findBeaconGate.drain(System.currentTimeMillis())
+        for (packet in released) {
+            val bridged = if (BACKBONE_PATH_TAG) packet else spendCrossingTtl(packet)
+            Log.d(TAG, "BLE→bridge BCAST-COALESCED ${packetTag(bridged)} (released after hold)")
+            broadcastToBackbone(bridged, originVisited())
+            bleToBridgeCounter.incrementAndGet()
+        }
+    }
+
     // --- Region-local routing helpers ---
 
     /**
@@ -475,12 +538,25 @@ class MeshRouterService : Service() {
      * but a fragmented public message does not.
      */
     private fun crossesBackbone(packet: BlemeshPacket): Boolean {
-        if (packet.type == MessageType.FRAGMENT.value) {
-            val inner = fragmentInnerType(packet) ?: return false
-            return MessageType.crossesBackboneAsBroadcast(inner)
-        }
-        return MessageType.crossesBackboneAsBroadcast(packet.type)
+        val type = crossingType(packet) ?: return false
+        return MessageType.crossesBackboneAsBroadcast(type)
     }
+
+    /**
+     * The type a broadcast is judged by at the backbone gate: its own, or for a
+     * FRAGMENT the inner reassembled type, so a fragmented announce crosses but
+     * a fragmented public message does not. Null when a FRAGMENT header is
+     * malformed (judged as non-crossing).
+     *
+     * Every backbone policy decision must run on THIS type, not `packet.type`.
+     * A compliant find beacon is ~48 payload bytes and can never fragment, but
+     * "crosses as a fragment, is rate-limited as a fragment" would mean the
+     * crossing allowlist and the rate limit disagreed about what a packet is —
+     * a fragment wrapper would then be an unmetered path onto the backbone for
+     * exactly the type the limit exists to meter.
+     */
+    private fun crossingType(packet: BlemeshPacket): Byte? =
+        if (packet.type == MessageType.FRAGMENT.value) fragmentInnerType(packet) else packet.type
 
     /**
      * The originalType byte from a FRAGMENT payload header
@@ -634,6 +710,11 @@ class MeshRouterService : Service() {
                 }
                 peerToHomeRouter.entries.removeAll { now - it.value.lastSeenMs > HOME_ROUTER_TTL_MS }
                 retryStormTracker.reap(now)
+                // Release find beacons held past their sender's backbone
+                // cooldown (FIND_MODE_SPEC.md §6). This sweep also reaps idle
+                // gate slots, so the gate stays bounded by senders currently
+                // beaconing rather than by every sender ever seen.
+                drainFindBeaconGate()
             }
         }
     }

@@ -47,6 +47,16 @@ enum class MessageType(val value: Byte) {
     MLS_MESSAGE(0x48),
     UWB_TOKEN_EXCHANGE(0x49),
 
+    // Find mode (FIND_MODE_SPEC.md §2). An E2E-encrypted position beacon
+    // broadcast to the sender's "contacts & favorites" audience — the router
+    // is a pure carrier: it never holds a find key, so the payload
+    // ([ver:1][keyId:4][nonce:12][ct+tag:31], ~48 B) is opaque ciphertext
+    // here and every routing decision is made on the header alone. 0x4A was
+    // verified free in this repo, loxation-android (BitChatProtocol.kt jumps
+    // 0x49 → 0x50) and loxation-sw before assignment; keep the three in
+    // lockstep.
+    FIND_BEACON(0x4A),
+
     // WebRTC signaling
     WEBRTC_SDP(0x50),
     WEBRTC_ICE(0x51),
@@ -98,11 +108,18 @@ enum class MessageType(val value: Byte) {
          * binary — compression wastes cycles on them and a cross-platform
          * decode mismatch here has corrupted payloads on iOS before.
          * Unknown codes: compressible (the payload-size heuristic still gates).
+         *
+         * FIND_BEACON (0x4A) is ciphertext + an Ed25519 signature (110 B,
+         * FIND_MODE_SPEC.md §2) — past CompressionUtil's 100-byte threshold,
+         * so the size heuristic does not keep it raw. Both phones pin it on
+         * `noCompressTypes` (iOS BinaryProtocol, Android
+         * BitChatProtocol.NO_COMPRESS_TYPES); this list is the third copy of
+         * that lockstep set, pinned by FindBeaconPolicyTest.
          */
         private val NO_COMPRESS = bytes(
             NOISE_HANDSHAKE, NOISE_ENCRYPTED,
             LOXATION_ANNOUNCE, LOXATION_CHUNK, LOXATION_QUERY, LOXATION_COMPLETE,
-            MLS_MESSAGE, REQUEST_SYNC, LOCATION_UPDATE,
+            MLS_MESSAGE, REQUEST_SYNC, LOCATION_UPDATE, FIND_BEACON,
         )
         fun isCompressible(type: Byte): Boolean = type !in NO_COMPRESS
 
@@ -130,6 +147,11 @@ enum class MessageType(val value: Byte) {
          * so a stale m1 replayed minutes later churns a session the phones
          * already re-established over another path (and a replayed 0x12 is
          * useless after any session reset anyway).
+         * FIND_BEACON is absent because store-and-forward is a DIRECTED-only
+         * buffer (maybeBufferForLater no-ops on broadcasts) and the beacon is
+         * always a broadcast. Its carry story is the gossip store instead
+         * (GOSSIP_STORED + the find-beacon sync bucket), which is
+         * newest-per-sender rather than a replay queue.
          * Unknown codes: NOT eligible — only buffer types whose replay
          * semantics we understand.
          */
@@ -152,7 +174,9 @@ enum class MessageType(val value: Byte) {
          * Unknown codes: NOT stored — the gossip stores are an include-list
          * by construction, and a push at least reaches open sync windows.
          */
-        private val GOSSIP_STORED = bytes(ANNOUNCE, MESSAGE, FRAGMENT, LOXATION_ANNOUNCE, LOCATION_UPDATE)
+        private val GOSSIP_STORED = bytes(
+            ANNOUNCE, MESSAGE, FRAGMENT, LOXATION_ANNOUNCE, LOCATION_UPDATE, FIND_BEACON
+        )
         fun isGossipStored(type: Byte): Boolean = type in GOSSIP_STORED
 
         /**
@@ -164,10 +188,42 @@ enum class MessageType(val value: Byte) {
          * chat stays region-local; it is the bulk broadcast traffic we cut off
          * the backbone. A FRAGMENT is classified by its inner reassembled type
          * (see MeshRouterService), not by 0x05 itself.
+         *
+         * FIND_BEACON (0x4A) is the venue-wide broadcast exception that
+         * REGION_LOCAL_ROUTING_SPEC.md §6 reserved ("operator/emergency
+         * announce… explicit allowlisted exception") and FIND_MODE_SPEC.md §6
+         * asks for: friend-finding is worthless if it stops at the region
+         * boundary — crossing venues IS the product. It is affordable because
+         * it is bounded on BOTH axes the public MESSAGE broadcast is not:
+         * ~70 wire bytes, and one crossing per sender per 30 s enforced by
+         * [FindBeaconBridgeGate] (see isBackboneRateLimited). It is also the
+         * only crossing type that is opaque to us — a router carries
+         * ciphertext it can never read.
          * Unknown codes: NOT crossed — only propagate presence types we know.
          */
-        private val CROSSES_BACKBONE = bytes(ANNOUNCE, LOXATION_ANNOUNCE, LEAVE, LOCATION_UPDATE)
+        private val CROSSES_BACKBONE = bytes(
+            ANNOUNCE, LOXATION_ANNOUNCE, LEAVE, LOCATION_UPDATE, FIND_BEACON
+        )
         fun crossesBackboneAsBroadcast(type: Byte): Boolean = type in CROSSES_BACKBONE
+
+        /**
+         * Crossing broadcasts that are coalesced newest-per-sender and
+         * rate-limited before they reach the backbone (FIND_MODE_SPEC.md §6:
+         * "rate-limited per sender (≥30 s), newest-per-sender coalescing at
+         * the bridge"). Applied ONLY at the origin router (the BLE→backbone
+         * hop); a beacon already on the backbone is re-forwarded unthrottled,
+         * because the origin's gate has already bounded the rate and a second
+         * throttle at each hop would drop beacons in multi-hop topologies.
+         *
+         * Announce/presence types are NOT here: their cadence is already
+         * ~30 s and the home-router learner needs every crossing announce it
+         * can get. The beacon is different — a FIND_REQ-boosted sender emits
+         * every ~5 s (spec §3), which is exactly the burst the backbone must
+         * not carry unfiltered.
+         * Unknown codes: NOT rate-limited (they don't cross at all).
+         */
+        private val BACKBONE_RATE_LIMITED = bytes(FIND_BEACON)
+        fun isBackboneRateLimited(type: Byte): Boolean = type in BACKBONE_RATE_LIMITED
 
         /**
          * Counted by the retry-storm diagnostic. ANNOUNCE is a periodic
@@ -176,8 +232,16 @@ enum class MessageType(val value: Byte) {
          * DELIVERY_ACK are the real signal.
          * Unknown codes: tracked — an unknown chatty type is exactly what
          * the diagnostic should surface.
+         *
+         * FIND_BEACON is exempt for the same reason ANNOUNCE is, and for the
+         * reason the fixed-window fix exists: it is a periodic broadcast
+         * heartbeat, and a FIND_REQ-boosted sender emits every ~5 s (spec §3)
+         * — six originations per 30 s window on one (sender, broadcast, type)
+         * bucket, i.e. a permanent bogus RETRY-STORM warning per finding
+         * peer. Real beacon trouble shows up as backbone gate stats, not as
+         * retransmit counts.
          */
-        private val RETRY_TRACKING_EXEMPT = bytes(ANNOUNCE, FRAGMENT)
+        private val RETRY_TRACKING_EXEMPT = bytes(ANNOUNCE, FRAGMENT, FIND_BEACON)
         fun isRetryTracked(type: Byte): Boolean = type !in RETRY_TRACKING_EXEMPT
 
         /**
