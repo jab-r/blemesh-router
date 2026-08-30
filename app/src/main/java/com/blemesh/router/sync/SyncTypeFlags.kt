@@ -21,6 +21,12 @@ data class SyncTypeFlags(val rawValue: Long) {
             MessageType.LOXATION_CHUNK -> 8
             MessageType.LOXATION_COMPLETE -> 9
             MessageType.LOCATION_UPDATE -> 10
+            // Find mode (FIND_MODE_SPEC.md §5): a NEW bucket at the END of the
+            // fixed order. Bit 11 was the next free index in all three
+            // implementations (iOS SyncTypeFlags.swift and loxation-android
+            // both stop at 10) — the bitfield is interop-locked, so this index
+            // must be claimed in lockstep, never renumbered.
+            MessageType.FIND_BEACON -> 11
             else -> null
         }
 
@@ -36,6 +42,7 @@ data class SyncTypeFlags(val rawValue: Long) {
             8 -> MessageType.LOXATION_CHUNK
             9 -> MessageType.LOXATION_COMPLETE
             10 -> MessageType.LOCATION_UPDATE
+            11 -> MessageType.FIND_BEACON
             else -> null
         }
 
@@ -44,6 +51,7 @@ data class SyncTypeFlags(val rawValue: Long) {
         val FRAGMENT = fromTypes(MessageType.FRAGMENT)
         val LOXATION_ANNOUNCE = fromTypes(MessageType.LOXATION_ANNOUNCE)
         val LOCATION_UPDATE = fromTypes(MessageType.LOCATION_UPDATE)
+        val FIND_BEACON = fromTypes(MessageType.FIND_BEACON)
         val PUBLIC_MESSAGES = fromTypes(MessageType.ANNOUNCE, MessageType.MESSAGE, MessageType.LOXATION_ANNOUNCE)
 
         fun fromTypes(vararg types: MessageType): SyncTypeFlags {
